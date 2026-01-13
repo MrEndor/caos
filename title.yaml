@@ -1,0 +1,16 @@
+---
+title: CAOS
+subtitle: Computer Architecture and Operating Systems
+author: MrEndor
+date: 2026
+lang: ru-RU
+toc: true
+toc-depth: 2
+geometry:
+  - margin=2cm
+  - top=2.5cm
+  - bottom=2.5cm
+numbersections: true
+colorlinks: true
+linkcolor: blue
+---

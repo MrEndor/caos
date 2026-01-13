@@ -1,0 +1,58 @@
+name: Build PDF from Markdown
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sections/**'
+      - 'title.yaml'
+      - '.github/workflows/build-pdf.yml'
+  workflow_dispatch:
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Pandoc and LaTeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-xetex texlive-fonts-recommended texlive-latex-extra texlive-lang-cyrillic fonts-liberation fonts-noto-cjk
+
+      - name: Verify files exist
+        run: |
+          ls -l title.yaml
+          find sections -name "*.md" -type f | sort -V
+
+      - name: Build PDF with Pandoc
+        run: |
+          pandoc title.yaml $(find sections -name "*.md" -type f | sort -V) \
+            -o caos.pdf \
+            --pdf-engine=xelatex \
+            --toc \
+            --top-level-division=chapter \
+            -V mainfont="Liberation Serif" \
+            -V sansfont="Liberation Sans" \
+            -V monofont="Liberation Mono" \
+            -V lang=ru
+
+      - name: Verify PDF created
+        run: |
+          ls -lh caos.pdf
+          file caos.pdf
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: caos-pdf
+          path: caos.pdf
+          retention-days: 30
+
+      - name: Create Release on Tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: caos.pdf
