@@ -90,8 +90,6 @@ int main() {
         perror("fork failed");
         return 1;
     }
-    
-    return 0;
 }
 ```
 

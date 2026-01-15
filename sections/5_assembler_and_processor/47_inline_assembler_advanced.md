@@ -16,8 +16,8 @@ int main() {
         : "r" (a), "r" (b)              // input constraints
         :                                // clobber list
     );
-    
-    printf("result = %d\n", result);    // 8
+
+    printf("result = %d\n", result);
     return 0;
 }
 ```
@@ -65,17 +65,15 @@ volatile asm("nop");  // volatile asm не оптимизируется
 
 int main() {
     int a = 5, b = 10;
-    
+
     printf("Before: a=%d, b=%d\n", a, b);
-    
+
     // Обмен через ассемблер (используя xchg)
     asm("xchgl %0, %1"
         : "+r" (a), "+r" (b)
     );
-    
+
     printf("After: a=%d, b=%d\n", a, b);
-    
-    return 0;
 }
 ```
 
@@ -176,7 +174,7 @@ int main() {
 **Пример уязвивого кода:**
 
 ```c
-int compare_passwords(const char *input, const char *stored) {
+int insecure_string_compare(const char *input, const char *stored) {
     for (int i = 0; i < strlen(stored); i++) {
         if (input[i] != stored[i])
             return 0;  // выход при первом несовпадении (ОПАСНО!)
@@ -190,14 +188,14 @@ int compare_passwords(const char *input, const char *stored) {
 **Защита через ассемблер (constant-time):**
 
 ```c
-int compare_constant_time(const uint8_t *a, const uint8_t *b, int len) {
+int constant_time_string_compare(const uint8_t *a, const uint8_t *b, int len) {
     volatile uint8_t result = 0;
-    
+
     // Проверить ВСЕ байты, даже если нашли несовпадение
     for (int i = 0; i < len; i++) {
         result |= a[i] ^ b[i];  // XOR даёт 0 если совпадает
     }
-    
+
     return result == 0;
 }
 ```
@@ -207,9 +205,9 @@ int compare_constant_time(const uint8_t *a, const uint8_t *b, int len) {
 ```c
 #include <stdint.h>
 
-int compare_constant_time_asm(const uint8_t *a, const uint8_t *b, int len) {
+int constant_time_string_compare(const uint8_t *a, const uint8_t *b, int len) {
     volatile uint8_t result = 0;
-    
+
     // Запретить оптимизации и использовать volatile memory operands
     asm volatile(
         "xorl %%eax, %%eax\n\t"
@@ -223,7 +221,7 @@ int compare_constant_time_asm(const uint8_t *a, const uint8_t *b, int len) {
         : "r"(a), "r"(b), "r"(len)
         : "rax"
     );
-    
+
     return result == 0;
 }
 ```

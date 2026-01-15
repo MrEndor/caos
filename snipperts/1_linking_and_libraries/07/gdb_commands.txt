@@ -1,0 +1,51 @@
+list
+
+break main
+break factorial
+
+run
+
+next
+next
+
+print x
+print result
+
+continue
+
+print n
+step
+print n
+step
+print n
+
+where
+
+backtrace full
+
+up
+print n
+down
+print n
+
+finish
+
+print arr
+print arr[0]
+print arr[1]
+print arr[2]
+print &arr[1]
+
+next
+print i
+print arr[i]
+next
+print i
+print arr[i]
+
+continue
+
+quit
+
+break file.cpp:42
+frame N

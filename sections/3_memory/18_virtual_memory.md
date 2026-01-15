@@ -188,10 +188,10 @@ x86-64.
 ```
 Виртуальный адрес: 0x12345678
 
-Биты 47-39: индекс в PML4 (4096 записей)
-Биты 38-30: индекс в PDPT (4096 записей)
-Биты 29-21: индекс в PD   (4096 записей)
-Биты 20-12: индекс в PT   (4096 записей)
+Биты 47-39: индекс в PML4 (512 записей)
+Биты 38-30: индекс в PDPT (512 записей)
+Биты 29-21: индекс в PD   (512 записей)
+Биты 20-12: индекс в PT   (512 записей)
 Биты 11-0:  смещение в странице (4096 байт = 4 КБ)
 
 Процесс:
@@ -325,7 +325,7 @@ int main() {
 
 ```bash
 # Просмотр TLB статистики
-sudo perf stat -e dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses ./program
+sudo perf stat -e dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses -p $(pgrep prog)
 
 # Output:
 #  123,456  dTLB-loads           (data TLB hits)
