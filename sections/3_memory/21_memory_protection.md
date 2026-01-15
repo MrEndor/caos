@@ -34,6 +34,13 @@ mprotect(ptr, size, PROT_READ);
 
 Упрощённый набросок (без проверки ABI/смещений):
 
+libmath.c
+```c
+double squre(double value) {
+    return value * value;
+}
+```
+
 ```c
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -55,14 +62,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Предположим, что по началу файла лежит функция double (*f)(double)
-    double (*func)(double) = (double (*)(double))addr;
+    double (*func)(double) = (double (*)(double))(addr + 0x40);
     double res = func(2.0);
     printf("%f\n", res);
 
     munmap(addr, st.st_size);
     close(fd);
-    return 0;
 }
 ```
 
@@ -70,7 +75,7 @@ int main(int argc, char **argv) {
 
 ##### Что означает ошибка Illegal intstruction? Покажите пример программы на Си, которая приводит к этой ошибке (естественным путем, т.е. не генерируя эту ошибку из кода напрямую).
 
-Сигнал `SIGILL` (`Illegal instruction`) процесс получает, когда процессор пытается выполнить 
+Сигнал `SIGILL` (`Illegal instruction`) процесс получает, когда процессор пытается выполнить
 **некорректную инструкцию**:
 
 - данные в памяти не являются валидным машинным кодом;

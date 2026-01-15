@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : ".";
 
     DIR *dir = opendir(path);
-    if (!dir) {
+    if (dir == NULL) {
         perror("opendir");
         return 1;
     }
