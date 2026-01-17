@@ -1,4 +1,6 @@
-gcc -fstack-protector-all stack_smashing_error.c           
+#!/usr/bin/env bash
+
+gcc -fstack-protector-all stack_smashing_error.c
 gcc -fno-stack-protector stack_smashing_error.c            
 gcc -fstack-protector-strong stack_samshing_error.c
 

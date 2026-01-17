@@ -19,9 +19,10 @@ nice -p <pid>
 Из кода:
 
 ```c
+#include <sys/resource.h>
 #include <unistd.h>
 
-int nice_value = getpriority(PRIO_PROCESS, 0);  // 0 = текущий процесс
+int nice_value = getpriority(PRIO_PROCESS, getpid());
 printf("Nice = %d\n", nice_value);
 ```
 
@@ -63,13 +64,16 @@ ps -eo pid,psr,comm             # PSR -- текущее ядро
 Из кода:
 
 ```c
+#define _GNU_SOURCE
 #include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
 
 cpu_set_t mask;
-sched_getaffinity(0, sizeof(mask), &mask);  // 0 = текущий процесс
+sched_getaffinity(getpid(), sizeof(mask), &mask);
 
 // Проверить, может ли процесс бежать на ядре 0
-if (CPU_ISSET(0, &mask)) {
+if (CPU_ISSET(getpid(), &mask)) {
     printf("Ядро 0 в affinity-маске\n");
 }
 ```
@@ -86,13 +90,14 @@ taskset -cp 0 ./prog            # запустить на ядре 0
 ```c
 #define _GNU_SOURCE
 #include <sched.h>
+#include <unistd.h>
 
 cpu_set_t mask;
 CPU_ZERO(&mask);
 CPU_SET(0, &mask);              // добавить ядро 0
 CPU_SET(1, &mask);              // добавить ядро 1
 
-sched_setaffinity(0, sizeof(mask), &mask);  // установить маску
+sched_setaffinity(getpid(), sizeof(mask), &mask);  // установить маску
 ```
 
 ##### Что такое process capabilities в Linux, какие они бывают?

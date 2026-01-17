@@ -1,0 +1,7 @@
+andq %rbx, %rax         ; rax &= rbx (побитовое И)
+orq %rbx, %rax          ; rax |= rbx  (побитовое ИЛИ)
+xorq %rbx, %rax         ; rax ^= rbx  (побитовое XOR)
+notq %rax               ; rax = ~rax  (побитовое НЕ)
+shlq $3, %rax           ; rax <<= 3   (левый сдвиг)
+shrq $3, %rax           ; rax >>= 3   (правый сдвиг логический)
+sarq $3, %rax           ; rax >>= 3   (арифметический сдвиг, сохраняет знак)

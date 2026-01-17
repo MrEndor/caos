@@ -67,7 +67,7 @@ ret $16                 # pop; add $16, %rsp; jmp (очистить аргуме
 rsp -> [return_address_of_caller]
 
 call func
-# CALL ДЕЛАЕТ: push $next_instruction; jmp func
+# CALL ДЕЛАЕТ: push return_address; jmp func
 
 # ПОСЛЕ CALL (в начале func):
 rsp -> [return_address]  # адрес, куда вернуться
