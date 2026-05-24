@@ -1,0 +1,129 @@
+site_name: CAOS Wiki — Низкоуровневое программирование
+site_description: Материалы курса по архитектуре компьютеров и операционным системам
+site_author: Egor Zherdev
+docs_dir: sections
+
+theme:
+  name: material
+  language: ru
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Тёмная тема
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Светлая тема
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - admonition
+  - footnotes
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Главная: index.md
+  - "Линковка и библиотеки":
+    - Обзор раздела: linking_and_libraries/index.md
+    - "Стадии сборки": linking_and_libraries/build_stages.md
+    - "Линковка и библиотеки": linking_and_libraries/linking_and_libraries_basics.md
+    - "Статическая и динамическая линковка": linking_and_libraries/static_dynamic_linking.md
+    - "Формат ELF": linking_and_libraries/elf_format.md
+    - "Символы и манглирование": linking_and_libraries/symbols_and_mangling.md
+    - "Запуск и завершение программы": linking_and_libraries/program_startup_shutdown.md
+  - "Файлы и файловые системы":
+    - Обзор раздела: files_and_filesystems/index.md
+    - "Файловые дескрипторы": files_and_filesystems/file_descriptors.md
+    - "Перенаправление ввода/вывода": files_and_filesystems/input_output_redirection.md
+    - "Основы файловых систем": files_and_filesystems/filesystems_basics.md
+    - "Операции с директориями": files_and_filesystems/directory_operations.md
+    - "mv и rm": files_and_filesystems/mv_and_rm_commands.md
+    - "Жёсткие и символические ссылки": files_and_filesystems/hard_and_symbolic_links.md
+    - "Права доступа и атрибуты": files_and_filesystems/file_permissions_and_attributes.md
+    - "Открытые файлы и процессы": files_and_filesystems/open_files_and_processes.md
+    - "Блочные и символьные устройства": files_and_filesystems/block_and_character_devices.md
+  - "Память":
+    - Обзор раздела: memory/index.md
+    - "Виртуальная память": memory/virtual_memory.md
+    - "Устройство памяти и аллокация": memory/memory_layout_and_allocation.md
+    - "mmap и маппинг файлов": memory/mmap_and_file_mapping.md
+    - "Защита памяти": memory/memory_protection.md
+    - "Реализация malloc и free": memory/malloc_and_free_implementation.md
+  - "Процессы":
+    - Обзор раздела: processes/index.md
+    - "Основы процессов": processes/processes_basics.md
+    - "fork и exec": processes/fork_and_exec.md
+    - "Состояния процессов, wait, sleep": processes/process_states_wait_sleep.md
+    - "Приоритеты, аффинность, capabilities": processes/process_priority_affinity_capabilities.md
+    - "rlimit": processes/rlimit.md
+    - "Сигналы": processes/signals.md
+    - "IPC: Pipes, FIFO, Shared memory": processes/ipc.md
+    - "Context switch (kernel)": processes/context_switch.md
+  - "Потоки и concurrency":
+    - Обзор раздела: threads/index.md
+    - "Потоки (основы)": threads/threads_basics.md
+    - "Реализация потоков (clone)": threads/thread_implementation_clone.md
+    - "Синхронизация: мьютексы, семафоры, futex": threads/thread_synchronization.md
+    - "Atomic операции и memory model": threads/atomics_and_memory_model.md
+    - "setjmp/longjmp и ucontext": threads/userspace_context_switching.md
+  - "Изоляция и контейнеры":
+    - Обзор раздела: isolation/index.md
+    - "seccomp": isolation/seccomp.md
+    - "Linux namespaces": isolation/namespaces.md
+    - "cgroups: углублённо": isolation/cgroups.md
+  - "Ассемблер и процессор":
+    - Обзор раздела: assembler_and_processor/index.md
+    - "Основы ассемблера": assembler_and_processor/assembler_basics.md
+    - "Условные переходы и флаги": assembler_and_processor/conditional_jumps_flags.md
+    - "Inline-ассемблер": assembler_and_processor/inline_assembler.md
+    - "Стековые фреймы и вызовы функций": assembler_and_processor/stack_frames_and_function_calls.md
+    - "Защита от переполнения буфера": assembler_and_processor/buffer_overflow_protection.md
+    - "Кэши процессора": assembler_and_processor/cpu_caches.md
+    - "Предсказание ветвлений": assembler_and_processor/branch_prediction.md
+    - "Параллелизм на уровне инструкций": assembler_and_processor/instruction_level_parallelism.md
+    - "Векторные инструкции (SIMD)": assembler_and_processor/vector_instructions_simd.md
+    - "Продвинутый inline-ассемблер": assembler_and_processor/inline_assembler_advanced.md
+    - "Режимы процессора и сисколлы": assembler_and_processor/processor_modes_and_syscalls.md
+    - "Системные вызовы (введение)": assembler_and_processor/system_calls_introduction.md
+    - "Прерывания": assembler_and_processor/interrupts.md
+    - "vDSO": assembler_and_processor/vdso.md
+  - "Сети":
+    - Обзор раздела: networking/index.md
+    - "Сокеты: API и базовые понятия": networking/sockets_basics.md
+    - "TCP и UDP: протоколы и тонкости": networking/tcp_udp.md
+    - "I/O multiplexing (select, poll, epoll)": networking/io_multiplexing.md
+    - "io_uring": networking/io_uring.md
+  - "Инструменты и отладка":
+    - Обзор раздела: tools_and_debugging/index.md
+    - "Отладка (GDB, sanitizers, perf, strace)": tools_and_debugging/debugging.md
+    - "ptrace: process tracing изнутри": tools_and_debugging/ptrace.md

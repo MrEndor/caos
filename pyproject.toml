@@ -1,0 +1,11 @@
+[project]
+name = "caos"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mkdocs>=1.6.1",
+    "mkdocs-autorefs>=1.4.4",
+    "mkdocs-material>=9.7.6",
+]
