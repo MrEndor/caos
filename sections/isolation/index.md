@@ -7,8 +7,10 @@
 
 ## Темы
 
-| Страница                          | Что рассматривается                                                                                                                           |
-|-----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| [seccomp](seccomp.md)             | Фильтрация системных вызовов: strict mode, BPF-фильтры, libseccomp, whitelist-подход                                                          |
-| [Linux namespaces](namespaces.md) | 8 типов namespaces, `clone`/`unshare`/`setns`, mount propagation, PID translation, user ns + UID mapping, veth pair, как собирается контейнер |
-| [cgroups: углублённо](cgroups.md) | v2 hierarchy, memory/io/pids controllers, PSI, systemd-oomd, freezer, eBPF cgroup programs                                                    |
+| Страница                                                     | Что рассматривается                                                                                                                           |
+|--------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| [seccomp](seccomp.md)                                        | Фильтрация системных вызовов: strict mode, BPF-фильтры, libseccomp, whitelist-подход                                                          |
+| [Linux namespaces](namespaces.md)                            | 8 типов namespaces, `clone`/`unshare`/`setns`, mount propagation, PID translation, user ns + UID mapping, veth pair, как собирается контейнер |
+| [cgroups: углублённо](cgroups.md)                            | v2 hierarchy, memory/io/pids controllers, PSI, systemd-oomd, freezer, eBPF cgroup programs                                                    |
+| [Внутреннее устройство контейнеров](containers_internals.md) | OCI image/runtime/distribution, OverlayFS и copy-up, runc/crun/youki, containerd shim, шаги `docker run`, bridge networking, rootless         |
+| [AppArmor и SELinux](apparmor_selinux.md)                    | MAC vs DAC, LSM framework, AppArmor path-based profiles, SELinux type enforcement (security context, RBAC, MLS, MCS, svirt), troubleshooting, сравнение |

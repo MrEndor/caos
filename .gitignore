@@ -1,12 +1,28 @@
-### Example user template template
-### Example user template
-
-# IntelliJ project files
+# IntelliJ
 .idea
 *.iml
 out
 gen
-### Obsidian template
-# config dir
+
+# Obsidian
 .obsidian/
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# MkDocs build output
+site/
+
+# Build artifacts
+*.o
+*.a
+*.so
+a.out
+core
+core.*
+*.pdf
+
+# examples compiled binaries
+examples/bin/

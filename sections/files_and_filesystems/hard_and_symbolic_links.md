@@ -80,7 +80,7 @@ ln -s /path/to/target symlink_name
  ┌───────────────────────────┐        ┌───────────────────────────┐
  │ "link.txt"  ──▶ inode 42  │        │ "link.txt"  ──▶ inode 99  │
  └───────────────────────────┘        └───────────────────────────┘
-       nlink: 1, данные живы                inode 99 data: "file.txt"
+       nlink: 1, данные живы                inode 99 data: "/home/user/file.txt"
                                             → ENOENT: битая ссылка
 ```
 

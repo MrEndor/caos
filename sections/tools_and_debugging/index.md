@@ -10,3 +10,5 @@
 |---------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | [Отладка (GDB, sanitizers, perf, strace)](debugging.md) | `gdb` (breakpoints, watchpoints, core dumps), AddressSanitizer / UBSan / TSan / MSan, `perf stat`/`record`/`sched`, `strace`/`ltrace`, valgrind callgrind/cachegrind/helgrind |
 | [ptrace: process tracing изнутри](ptrace.md)            | `PTRACE_ATTACH`/`SEIZE`, syscall stops, code injection, Yama LSM, реализация strace в 50 строк, graftcp как нестандартное применение                                          |
+
+eBPF вынесен в [отдельный раздел](../ebpf/index.md): foundations, tracing, networking, security.

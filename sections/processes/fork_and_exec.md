@@ -61,7 +61,7 @@ fork(): parent/child с Copy-on-Write
 │                  │                │                  │   │                  │
 │  page table      │                │  page table      │   │  page table      │
 │  ┌─────────────┐ │                │  ┌─────────────┐ │   │  ┌─────────────┐ │
-│  │ code  ──────┼─┼──▶ [phys]      │  │ code  ──────┼─┼──▶│  │ code  ──────┼─┼──▶ [phys] (общий)
+│  │ code  ──────┼─┼──▶ [phys]      │  │ code  ──────┼─┼──▶│  │ code  ──────┼─┼──▶ [phys] (shared, RO без CoW)
 │  │ data  ──────┼─┼──▶ [phys]      │  │ data  ──────┼─┼──▶│  │ data  ──────┼─┼──▶ [phys] (общий, RO)
 │  │ heap  ──────┼─┼──▶ [phys]      │  │ heap  ──────┼─┼──▶│  │ heap  ──────┼─┼──▶ [phys] (общий, RO)
 │  │ stack ──────┼─┼──▶ [phys]      │  │ stack ──────┼─┼──▶│  │ stack ──────┼─┼──▶ [phys] (общий, RO)
@@ -234,7 +234,7 @@ CoW делает его достаточно быстрым. Флаг `CLONE_VFO
 - [Состояния процессов, wait, sleep](process_states_wait_sleep.md) — что происходит с процессом после fork: состояния
   R/S/Z, зомби
 - [Сигналы](signals.md) — наследование обработчиков и маски сигналов дочерним процессом
-- [Реализация потоков (clone)](../threads/thread_implementation_clone.md) — `clone(2)` как обобщение fork
+- [Реализация потоков (clone)](../concurrency/thread_implementation_clone.md) — `clone(2)` как обобщение fork
 
 ## Источники
 

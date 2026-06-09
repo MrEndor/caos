@@ -61,36 +61,19 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 - **group-stop** — job-control остановка (SIGSTOP/SIGTSTP), не связана с ptrace напрямую
 - **exited / zombie** — завершён, ждёт `wait()` от parent
 
-```
-                                ┌──────────────────────────┐
-                                │       tracee state       │
-                                └──────────────────────────┘
-
-         ┌─────────────────────────────────────────────────────────────┐
-         │                                                             │
-         ▼                                                             │
-     ┌─────────┐    syscall/signal/event       ┌──────────────────┐    │
-     │ running │ ─────────────────────────────▶│   ptrace-stop    │    │
-     │         │                               │ (kernel ждёт TR) │    │
-     │         │ ◀─────────────────────────────│                  │    │
-     └─────────┘   PTRACE_CONT / SYSCALL       └────────┬─────────┘    │
-         │                                              │              │
-         │              SIGSTOP                         │              │
-         │           (job control)                      │              │
-         ▼                                              │              │
-     ┌─────────┐                                        │              │
-     │ group-  │                                        │              │
-     │  stop   │ ───────────────────────────────────────┘              │
-     │         │      SIGCONT (или PTRACE_LISTEN после SEIZE)          │
-     └────┬────┘                                                       │
-          │                                                            │
-          └────────────────────────────────────────────────────────────┘
-                                  │
-                                  │  exit(), kill(SIGKILL)
-                                  ▼
-                              ┌─────────┐
-                              │ exited  │
-                              └─────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> running
+    running --> ptrace_stop: syscall / signal / event
+    ptrace_stop --> running: PTRACE_CONT / SYSCALL
+    running --> group_stop: SIGSTOP (job control)
+    group_stop --> running: SIGCONT (или PTRACE_LISTEN после SEIZE)
+    running --> exited: exit(), kill(SIGKILL)
+    ptrace_stop --> exited: kill
+    group_stop --> exited: kill
+    exited --> [*]
+    ptrace_stop: ptrace-stop (kernel ждёт TR)
+    group_stop: group-stop
 ```
 
 Tracer узнаёт о каждом stop через `waitpid()` — wait возвращает PID остановленного потока, а `status` через макросы
@@ -102,31 +85,21 @@ Tracer узнаёт о каждом stop через `waitpid()` — wait воз�
 Под общим именем «ptrace-stop» скрывается несколько разных событий, и tracer обязан различать их, чтобы реагировать
 правильно.
 
-```
-                          ┌──────── tracee остановлен ────────┐
-                          │                                   │
-                          ▼                                   ▼
-                   ┌────────────┐                     ┌──────────────┐
-                   │ group-stop │                     │ ptrace-stop  │
-                   │ (SIGSTOP,  │                     │              │
-                   │  SIGTSTP)  │                     │              │
-                   └────────────┘                     └──────┬───────┘
-                          ▲                                  │
-                          │                                  │
-                  это не ptrace,         ┌──────────────────┼──────────────────────┐
-                  это job control        │                  │                      │
-                                         ▼                  ▼                      ▼
-                                ┌─────────────────┐ ┌─────────────────┐ ┌────────────────────┐
-                                │ signal-delivery │ │   syscall-stop  │ │  PTRACE_EVENT_*    │
-                                │      stop       │ │  enter / exit   │ │ FORK/CLONE/EXEC/   │
-                                │                 │ │                 │ │ EXIT/SECCOMP/STOP  │
-                                │ tracee получил  │ │ при входе и     │ │                    │
-                                │ сигнал, kernel  │ │ выходе syscall  │ │ событие, на которое│
-                                │ дал tracer'у    │ │ (PTRACE_SYSCALL │ │ подписался через   │
-                                │ право решить    │ │  включён)       │ │ PTRACE_SETOPTIONS  │
-                                └─────────────────┘ └─────────────────┘ └────────────────────┘
-
-                                          + single-step-stop (после PTRACE_SINGLESTEP)
+```mermaid
+flowchart TB
+    Top["tracee остановлен"]
+    GS["group-stop<br/>(SIGSTOP, SIGTSTP)<br/>это не ptrace,<br/>это job control"]
+    PS["ptrace-stop"]
+    SD["signal-delivery-stop<br/>tracee получил сигнал,<br/>kernel дал tracer'у право решить"]
+    SS["syscall-stop<br/>enter / exit<br/>при входе и выходе syscall<br/>(PTRACE_SYSCALL включён)"]
+    PE["PTRACE_EVENT_*<br/>FORK/CLONE/EXEC/EXIT/SECCOMP/STOP<br/>событие, на которое подписался<br/>через PTRACE_SETOPTIONS"]
+    SST["single-step-stop<br/>(после PTRACE_SINGLESTEP)"]
+    Top --> GS
+    Top --> PS
+    PS --> SD
+    PS --> SS
+    PS --> PE
+    PS --> SST
 ```
 
 **signal-delivery-stop**. Tracee получает любой сигнал (кроме SIGKILL — этот не остановить). Kernel ставит tracee в
@@ -224,32 +197,27 @@ int main(int argc, char *argv[]) {
 Главное, что нужно понимать: `PTRACE_SYSCALL` даёт **два** stop'а на каждый syscall — на входе и на выходе. Это
 позволяет не только видеть, что было вызвано, но и видеть, что вернулось.
 
-```
-такт │   tracee                     kernel                      tracer
-─────┼───────────────────────────────────────────────────────────────────────────
-  0  │  userspace код                                          ждёт в waitpid()
-     │  ...
-  1  │  mov rax, 0   (read)
-     │  mov rdi, fd                                                ↑
-     │  syscall  ─────────────────▶ переход в ring 0               │
-  2  │                              kernel видит PT_PTRACED        │
-     │                              ставит tracee в ptrace-stop ──▶ waitpid() возвращает
-  3  │                                                              tracer:
-     │                              ◀────────────────────────────── ptrace(GETREGS) → orig_rax=0
-     │                                                              tracer:
-     │                                                              решает: пропустить как есть
-  4  │                              ◀────────────────────────────── ptrace(SYSCALL)
-     │                              sys_read() реально работает
-     │                              читает данные с диска/сокета
-  5  │                              перед return to userspace
-     │                              второй ptrace-stop ──────────▶ waitpid() возвращает
-  6  │                                                              tracer:
-     │                              ◀────────────────────────────── ptrace(GETREGS) → rax=N
-     │                                                              tracer: лог "read = N"
-  7  │                              ◀────────────────────────────── ptrace(SYSCALL)
-     │  возврат в userspace                                        ↓
-     │  rax = N                                                   ждёт следующего stop
-     │  ...
+```mermaid
+sequenceDiagram
+    participant Tracee
+    participant Kernel
+    participant Tracer
+    Note over Tracer: tact 0: ждёт в waitpid()
+    Note over Tracee: tact 1: mov rax,0 (read);<br/>mov rdi,fd; syscall
+    Tracee->>Kernel: syscall → ring 0
+    Note over Kernel: tact 2: видит PT_PTRACED,<br/>ставит tracee в ptrace-stop
+    Kernel-->>Tracer: waitpid() returns
+    Tracer->>Kernel: tact 3: ptrace(GETREGS) → orig_rax=0
+    Note over Tracer: решает: пропустить как есть
+    Tracer->>Kernel: tact 4: ptrace(SYSCALL)
+    Note over Kernel: sys_read() реально работает,<br/>читает данные с диска/сокета
+    Note over Kernel: tact 5: перед return to userspace,<br/>второй ptrace-stop
+    Kernel-->>Tracer: waitpid() returns
+    Tracer->>Kernel: tact 6: ptrace(GETREGS) → rax=N
+    Note over Tracer: лог "read = N"
+    Tracer->>Kernel: tact 7: ptrace(SYSCALL)
+    Kernel->>Tracee: возврат в userspace, rax = N
+    Note over Tracer: ждёт следующего stop
 ```
 
 На входе в syscall есть нюанс: `rax` в момент stop равен `-ENOSYS` (kernel ставит это как маркер «syscall ещё не
@@ -354,59 +322,25 @@ Modern tooling — strace ≥ 4.9, gdb ≥ 7.4 — использует SEIZE п
 Если tracer может писать в память и менять rip, он может выполнить произвольный код от имени tracee. Эта техника лежит в
 основе DLL-инжекторов, CRIU parasite code и команды `call` в gdb. Алгоритм:
 
-```
-   ┌────────────────────────────────────────────────────────────────────────┐
-   │                       code injection flow                              │
-   └────────────────────────────────────────────────────────────────────────┘
-
-  ┌─────────┐                                              ┌─────────────┐
-  │ tracer  │                                              │   tracee    │
-  └────┬────┘                                              └──────┬──────┘
-       │                                                          │
-       │  1. PTRACE_ATTACH (или SEIZE + INTERRUPT)                │
-       │ ────────────────────────────────────────────────────────▶│
-       │                                            ptrace-stop ◀─│
-       │                                                          │
-       │  2. PTRACE_GETREGS — сохранить rip, rsp, rax, ...        │
-       │                                                          │
-       │  3. PTRACE_PEEKDATA(rip) — сохранить старые байты        │
-       │  ┌─────────────────────────────┐                         │
-       │  │ save: 48 89 e5 ... (8 байт) │                         │
-       │  └─────────────────────────────┘                         │
-       │                                                          │
-       │  4. POKETEXT(rip, syscall_stub)                          │
-       │     stub: mov rax,9 / mov rdi,0 / ... / syscall          │
-       │     (вызов mmap для выделения страницы под shellcode)    │
-       │                                                          │
-       │  5. PTRACE_CONT, ждать SIGTRAP/SIGSEGV после stub        │
-       │ ────────────────────────────────────────────────────────▶│
-       │                                          выполняет stub  │
-       │                                          mmap → rax=addr │
-       │                                                   trap  ◀│
-       │                                                          │
-       │  6. GETREGS → rax = адрес новой страницы                 │
-       │                                                          │
-       │  7. POKETEXT(rax_новая_страница, shellcode)              │
-       │     (или process_vm_writev для скорости)                 │
-       │                                                          │
-       │  8. SETREGS: rip = rax_новая_страница                    │
-       │     PTRACE_CONT                                          │
-       │ ────────────────────────────────────────────────────────▶│
-       │                                       выполняет shellcode│
-       │                                       (открывает sock,   │
-       │                                        грузит .so, ...)  │
-       │                                                          │
-       │  9. После завершения shellcode (int3 в конце):           │
-       │     SIGTRAP                                              │
-       │ ◀──────────────────────────────────────────────────────  │
-       │                                                          │
-       │ 10. POKETEXT — восстановить байты по старому rip         │
-       │     SETREGS — восстановить регистры                      │
-       │     PTRACE_DETACH                                        │
-       │ ────────────────────────────────────────────────────────▶│
-       │                                  продолжает обычную жизнь│
-       │                                  как ни в чём не бывало  │
-       ▼                                                          ▼
+```mermaid
+sequenceDiagram
+    participant Tracer
+    participant Tracee
+    Tracer->>Tracee: 1. PTRACE_ATTACH (или SEIZE + INTERRUPT)
+    Note over Tracee: ptrace-stop
+    Note over Tracer: 2. PTRACE_GETREGS — сохранить rip, rsp, rax, ...
+    Note over Tracer: 3. PTRACE_PEEKDATA(rip) — сохранить старые байты<br/>save: 48 89 e5 ... (8 байт)
+    Note over Tracer: 4. POKETEXT(rip, syscall_stub)<br/>stub: mov rax,9 / mov rdi,0 / ... / syscall<br/>(вызов mmap для shellcode page)
+    Tracer->>Tracee: 5. PTRACE_CONT
+    Note over Tracee: выполняет stub, mmap → rax=addr, trap
+    Note over Tracer: 6. GETREGS → rax = адрес новой страницы
+    Note over Tracer: 7. POKETEXT(rax_новая_страница, shellcode)<br/>(или process_vm_writev)
+    Tracer->>Tracee: 8. SETREGS rip = rax_новая_страница; PTRACE_CONT
+    Note over Tracee: выполняет shellcode<br/>(открывает sock, грузит .so, ...)
+    Tracee-->>Tracer: 9. SIGTRAP после int3 в конце shellcode
+    Note over Tracer: 10. POKETEXT — восстановить байты<br/>SETREGS — восстановить регистры
+    Tracer->>Tracee: PTRACE_DETACH
+    Note over Tracee: продолжает обычную жизнь
 ```
 
 Тонкости. `mmap` нужен потому, что обычно нет готового исполняемого региона, куда можно безопасно писать произвольный
@@ -516,32 +450,17 @@ ptrace остаётся незаменимым там, где нужно име�
 
 graftcp состоит из двух компонентов:
 
-```
-       ┌──────────────────────────────────────────────────────────────┐
-       │                       graftcp архитектура                    │
-       └──────────────────────────────────────────────────────────────┘
-
-  пользователь:  $ graftcp -- curl https://api.example.com
-
-   ┌──────────────────┐
-   │  graftcp (C)     │  tracer, запускает target через fork+exec+TRACEME
-   │                  │  перехватывает connect/clone/close
-   └────┬─────────────┘
-        │ ptrace
-        ▼
-   ┌──────────────────┐
-   │  curl (tracee)   │  ничего не знает о прокси
-   │                  │  думает что соединяется напрямую
-   └────┬─────────────┘
-        │ TCP к 1.2.3.4:443?
-        │ → подменено на 127.0.0.1:2233
-        ▼
-   ┌──────────────────┐         ┌──────────────────┐
-   │ graftcp-local    │──SOCKS─▶│  upstream proxy  │
-   │ (Go)             │         │  127.0.0.1:1080  │
-   │ слушает          │         └──────────────────┘
-   │ 127.0.0.1:2233   │
-   └──────────────────┘
+```mermaid
+graph TB
+    U["пользователь:<br/>$ graftcp -- curl https://api.example.com"]
+    GC["graftcp (C)<br/>tracer, fork+exec+TRACEME,<br/>перехватывает connect/clone/close"]
+    CURL["curl (tracee)<br/>не знает о прокси,<br/>думает что соединяется напрямую"]
+    GL["graftcp-local (Go)<br/>слушает 127.0.0.1:2233"]
+    UP["upstream proxy<br/>127.0.0.1:1080"]
+    U --> GC
+    GC -->|ptrace| CURL
+    CURL -->|"TCP к 1.2.3.4:443?<br/>→ подменено на 127.0.0.1:2233"| GL
+    GL -->|SOCKS| UP
 ```
 
 - **graftcp** — tracer на C, запускает целевую программу и ptrace'ит её
@@ -555,61 +474,30 @@ N от PID P должно идти на 1.2.3.4:443». graftcp-local запом�
 
 Главный трюк — подмена `sockaddr` в памяти tracee прямо в syscall-enter-stop:
 
-```
-                ┌──────────────────────────────────────────────────────┐
-                │           graftcp: перехват connect()                │
-                └──────────────────────────────────────────────────────┘
-
-tracee                                tracer                graftcp-local
-  │                                     │                        │
-  │  fd = socket(AF_INET, ...)          │                        │
-  │  sockaddr.sin_addr = 1.2.3.4        │                        │
-  │  sockaddr.sin_port = 443            │                        │
-  │  connect(fd, &sockaddr, 16)         │                        │
-  │  syscall ──────────────────▶ ENTER stop                      │
-  │                                     │                        │
-  │                                     │  GETREGS:              │
-  │                                     │    orig_rax = 42 (connect)
-  │                                     │    rdi = fd            │
-  │                                     │    rsi = &sockaddr     │
-  │                                     │    rdx = 16            │
-  │                                     │                        │
-  │                                     │  process_vm_readv:     │
-  │                                     │    sockaddr из памяти  │
-  │                                     │                        │
-  │                                     │  фильтр: AF_INET? да   │
-  │                                     │                        │
-  │                                     │  сохранить в таблице:  │
-  │                                     │    {pid,fd} → 1.2.3.4:443
-  │                                     │                        │
-  │                                     │  через Unix socket: ──▶│
-  │                                     │  "pid=P fd=N           │ зарегистрировал
-  │                                     │   target=1.2.3.4:443"  │ ожидающее соединение
-  │                                     │                        │
-  │                                     │  POKETEXT/writev:      │
-  │                                     │  подменить sockaddr →  │
-  │                                     │  127.0.0.1:2233        │
-  │                                     │                        │
-  │                                     │  PTRACE_SYSCALL        │
-  │  ◀───────────────────────────       │                        │
-  │  kernel выполняет connect на        │                        │
-  │  127.0.0.1:2233                     │                        │
-  │                                     │                        │
-  │                                     │ ◀── accept() ──────────│
-  │                                     │                        │ ─── socks5 handshake ──▶
-  │                                     │                        │ ─── connect 1.2.3.4 ───▶
-  │                                     │                        │ ◀── proxy connected ───
-  │                                     │                        │
-  │  возврат: rax = 0                   │                        │
-  │  ◀──────────────────────  EXIT stop                          │
-  │                                     │  (опционально          │
-  │                                     │   восстановить байты)  │
-  │                                     │  PTRACE_SYSCALL        │
-  │  ◀───────────────────────────       │                        │
-  │                                     │                        │
-  │  read/write на fd → идут через      │                        │
-  │  graftcp-local → upstream proxy →   │                        │
-  │  настоящий destination              │                        │
+```mermaid
+sequenceDiagram
+    participant Tracee
+    participant Tracer
+    participant GL as graftcp-local
+    participant Proxy as upstream proxy
+    Note over Tracee: fd = socket(AF_INET, ...)<br/>sockaddr = 1.2.3.4:443<br/>connect(fd, &sockaddr, 16)
+    Tracee->>Tracer: ENTER stop (connect)
+    Note over Tracer: GETREGS:<br/>orig_rax=42 (connect),<br/>rdi=fd, rsi=&sockaddr, rdx=16
+    Note over Tracer: process_vm_readv:<br/>sockaddr из памяти
+    Note over Tracer: фильтр AF_INET? да<br/>сохранить {pid,fd} → 1.2.3.4:443
+    Tracer->>GL: "pid=P fd=N target=1.2.3.4:443"
+    Note over GL: зарегистрировал ожидающее соединение
+    Note over Tracer: POKETEXT/writev:<br/>подменить sockaddr → 127.0.0.1:2233
+    Tracer->>Tracee: PTRACE_SYSCALL
+    Note over Tracee: kernel выполняет connect на 127.0.0.1:2233
+    Tracee->>GL: accept()
+    GL->>Proxy: socks5 handshake
+    GL->>Proxy: connect 1.2.3.4
+    Proxy-->>GL: proxy connected
+    Tracee->>Tracer: EXIT stop (rax = 0)
+    Note over Tracer: (опционально восстановить байты)
+    Tracer->>Tracee: PTRACE_SYSCALL
+    Note over Tracee,Proxy: read/write на fd → graftcp-local → upstream proxy → настоящий destination
 ```
 
 Перехватываемые syscall'ы:

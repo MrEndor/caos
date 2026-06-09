@@ -69,22 +69,19 @@ permitted (selective acknowledgements), timestamps (для RTT измерени�
 Установление соединения — обмен тремя сегментами. Каждая сторона выбирает свой initial sequence number (ISN),
 исторически псевдослучайный для защиты от подмены.
 
-```
-client                                                   server
-  │                                                        │
-  │  CLOSED                                       LISTEN   │
-  │                                                        │
-  │  SYN, seq=X                                            │
-  │ ─────────────────────────────────────────────────────▶ │
-  │  SYN_SENT                                  SYN_RECV    │
-  │                                                        │
-  │  SYN+ACK, seq=Y, ack=X+1                               │
-  │ ◀───────────────────────────────────────────────────── │
-  │                                                        │
-  │  ACK, seq=X+1, ack=Y+1                                 │
-  │ ─────────────────────────────────────────────────────▶ │
-  │  ESTABLISHED                            ESTABLISHED    │
-  │                                                        │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    Note over Client: CLOSED
+    Note over Server: LISTEN
+    Client->>Server: SYN, seq=X
+    Note over Client: SYN_SENT
+    Note over Server: SYN_RECV
+    Server->>Client: SYN+ACK, seq=Y, ack=X+1
+    Client->>Server: ACK, seq=X+1, ack=Y+1
+    Note over Client: ESTABLISHED
+    Note over Server: ESTABLISHED
 ```
 
 После `listen(fd, backlog)` ядро держит две очереди:
@@ -115,32 +112,23 @@ SYN cookies теряют опции из SYN (MSS округляется до о
 
 Закрытие — четыре сегмента, потому что TCP — full-duplex и каждое направление закрывается независимо.
 
-```
-active close (initiator)                       passive close (peer)
-        │                                              │
-        │  FIN, seq=M                                  │
-        │ ───────────────────────────────────────────▶ │
-        │  FIN_WAIT_1                       CLOSE_WAIT │
-        │                                              │
-        │  ACK, ack=M+1                                │
-        │ ◀─────────────────────────────────────────── │
-        │  FIN_WAIT_2                                  │
-        │                                              │
-        │                              приложение      │
-        │                              продолжает      │
-        │                              работать,       │
-        │                              затем close()   │
-        │                                              │
-        │  FIN, seq=N                                  │
-        │ ◀─────────────────────────────────────────── │
-        │                                   LAST_ACK   │
-        │                                              │
-        │  ACK, ack=N+1                                │
-        │ ───────────────────────────────────────────▶ │
-        │  TIME_WAIT                          CLOSED   │
-        │                                              │
-        │  ... ждёт 2×MSL ...                          │
-        │  CLOSED                                      │
+```mermaid
+sequenceDiagram
+    participant Initiator as active close (initiator)
+    participant Peer as passive close (peer)
+    Initiator->>Peer: FIN, seq=M
+    Note over Initiator: FIN_WAIT_1
+    Note over Peer: CLOSE_WAIT
+    Peer->>Initiator: ACK, ack=M+1
+    Note over Initiator: FIN_WAIT_2
+    Note over Peer: приложение продолжает работать, затем close()
+    Peer->>Initiator: FIN, seq=N
+    Note over Peer: LAST_ACK
+    Initiator->>Peer: ACK, ack=N+1
+    Note over Initiator: TIME_WAIT
+    Note over Peer: CLOSED
+    Note over Initiator: ... ждёт 2×MSL ...
+    Note over Initiator: CLOSED
 ```
 
 ### Half-close
@@ -153,61 +141,35 @@ peer может ещё что-то слать. Так работает HTTP/1.0 
 
 Главная диаграмма TCP. Состояния и переходы видны в `ss -tan state ...` и `/proc/net/tcp`.
 
-```
-                              ┌────────────┐
-                              │   CLOSED   │
-                              └─────┬──────┘
-                  passive open      │      active open
-                  (listen)          │      (connect → SYN)
-                       ┌────────────┼────────────┐
-                       ▼            │            ▼
-                ┌────────────┐      │     ┌────────────┐
-                │   LISTEN   │      │     │ SYN_SENT   │
-                └─────┬──────┘      │     └─────┬──────┘
-       recv SYN       │             │           │ recv SYN+ACK
-       send SYN+ACK   │             │           │ send ACK
-                      ▼             │           ▼
-                ┌────────────┐      │     ┌────────────────┐
-                │  SYN_RECV  │      │     │                │
-                └─────┬──────┘      │     │                │
-                      │             │     │                │
-        recv ACK      │             │     │                │
-                      └────────────▶┼◀────┘                │
-                                    ▼                      │
-                              ┌────────────┐               │
-                              │ESTABLISHED │               │
-                              └─────┬──────┘               │
-                                    │                      │
-                  ┌─────────────────┼─────────────────┐    │
-                  │                 │                 │    │
-       close()    │                 │   recv FIN      │    │
-       send FIN   │                 │   send ACK      │    │
-       (active)   ▼                 ▼   (passive)     │    │
-            ┌────────────┐    ┌────────────┐          │    │
-            │ FIN_WAIT_1 │    │ CLOSE_WAIT │          │    │
-            └─────┬──────┘    └─────┬──────┘          │    │
-                  │                 │ close()         │    │
-        recv ACK  │                 │ send FIN        │    │
-                  ▼                 ▼                 │    │
-            ┌────────────┐    ┌────────────┐          │    │
-            │ FIN_WAIT_2 │    │  LAST_ACK  │          │    │
-            └─────┬──────┘    └─────┬──────┘          │    │
-                  │                 │ recv ACK        │    │
-        recv FIN  │                 ▼                 │    │
-        send ACK  │            ┌────────────┐         │    │
-                  ▼            │   CLOSED   │         │    │
-            ┌────────────┐     └────────────┘         │    │
-            │ TIME_WAIT  │                            │    │
-            └─────┬──────┘                            │    │
-                  │ wait 2 × MSL                      │    │
-                  ▼                                   │    │
-            ┌────────────┐                            │    │
-            │   CLOSED   │◀───────────────────────────┴────┘
-            └────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED
+    CLOSED --> LISTEN: passive open (listen)
+    CLOSED --> SYN_SENT: active open (connect → SYN)
+    LISTEN --> SYN_RECV: recv SYN / send SYN+ACK
+    SYN_SENT --> ESTABLISHED: recv SYN+ACK / send ACK
+    SYN_RECV --> ESTABLISHED: recv ACK
+    ESTABLISHED --> FIN_WAIT_1: close() / send FIN (active)
+    ESTABLISHED --> CLOSE_WAIT: recv FIN / send ACK (passive)
+    FIN_WAIT_1 --> FIN_WAIT_2: recv ACK
+    FIN_WAIT_2 --> TIME_WAIT: recv FIN / send ACK
+    CLOSE_WAIT --> LAST_ACK: close() / send FIN
+    LAST_ACK --> CLOSED: recv ACK
+    TIME_WAIT --> CLOSED: wait 2 × MSL
+    CLOSED --> [*]
 ```
 
 Существует также состояние **CLOSING** — симметричное закрытие, когда оба конца одновременно послали FIN; редко, но
-встречается.
+встречается. Ветка simultaneous close из общей диаграммы:
+
+```mermaid
+stateDiagram-v2
+    FIN_WAIT_1: FIN_WAIT_1 (послал FIN, ждёт ACK)
+    CLOSING: CLOSING (обе стороны послали FIN, ждём ACK на свой FIN)
+    FIN_WAIT_1 --> CLOSING: recv FIN / send ACK<br/>(peer тоже закрылся одновременно — ACK ещё не пришёл)
+    CLOSING --> TIME_WAIT: recv ACK
+```
+
 
 ## TIME_WAIT
 
@@ -293,7 +255,7 @@ retransmit) — `cwnd /= 2`, продолжаем fast recovery. При retransm
 ```
 cwnd
   ▲
-  │                                      ssthresh ─ ─ ─ ─
+  │                                      ssthresh (new, после loss) ─ ─
   │                          ╱──────╲                   ╱─
   │                         ╱        ╲                 ╱
   │                        ╱          ╲              ╱
@@ -305,7 +267,7 @@ cwnd
   │   slow start    ╱      congestion
   │   (exp)        ╱       avoidance (linear)
   │              ╱
-  │ ─ ─ ─ ─ ─ ─╱──── ssthresh
+  │ ─ ─ ─ ─ ─ ─╱──── ssthresh (initial; обновляется при loss до cwnd/2)
   │           ╱
   │         ╱
   │       ╱
@@ -341,23 +303,16 @@ sysctl -w net.ipv4.tcp_congestion_control=bbr    # сменить
 
 По отдельности оба разумны. Вместе дают патологию: sender пишет два маленьких блока подряд.
 
-```
-sender                                                  receiver
-  │  send block1 (small)                                   │
-  │ ─────────────────────────────────────────────────────▶ │
-  │                                                        │
-  │  Nagle блокирует block2: есть unacked                  │
-  │                                                        │
-  │                                              delayed ACK
-  │                                              ждёт ~40 мс
-  │                                                        │
-  │  ◀───── 40–200 мс простой ────▶                        │
-  │                                                        │
-  │                                       ACK              │
-  │ ◀───────────────────────────────────────────────────── │
-  │                                                        │
-  │  send block2                                           │
-  │ ─────────────────────────────────────────────────────▶ │
+```mermaid
+sequenceDiagram
+    participant Sender
+    participant Receiver
+    Sender->>Receiver: send block1 (small)
+    Note over Sender: Nagle блокирует block2: есть unacked
+    Note over Receiver: delayed ACK ждёт ~40 мс
+    Note over Sender,Receiver: 40–200 мс простой
+    Receiver->>Sender: ACK
+    Sender->>Receiver: send block2
 ```
 
 Латентность вырастает на десятки-сотни миллисекунд из ничего.
@@ -496,22 +451,19 @@ UDP — почти прямой доступ к IP с добавлением п�
 `SO_REUSEPORT` (Linux 3.9+) разрешает **нескольким** независимым сокетам в **разных** процессах биндиться на один порт.
 Ядро само распределяет входящие connections между ними по hash от 4-tuple (`src_ip, src_port, dst_ip, dst_port`).
 
-```
-                          ┌─────────────────────────────┐
-                          │       kernel TCP/IP         │
-                          │                             │
-                          │  hash(src_ip, src_port)     │
-                          │       │                     │
-                 ┌────────┼───────┼───────────┐         │
-                 │        │       │           │         │
-                 ▼        ▼       ▼           ▼         │
-              listen   listen  listen      listen       │
-              fd #1    fd #2   fd #3       fd #4        │
-              ↓        ↓       ↓           ↓            │
-              accept   accept  accept      accept       │
-              в proc1  в proc2 в proc3     в proc4      │
-                          │                             │
-                          └─────────────────────────────┘
+```mermaid
+flowchart TB
+    incoming[incoming SYN]
+    hash["kernel TCP/IP<br/>hash(src_ip, src_port)"]
+    incoming --> hash
+    hash --> fd1[listen fd #1]
+    hash --> fd2[listen fd #2]
+    hash --> fd3[listen fd #3]
+    hash --> fd4[listen fd #4]
+    fd1 --> acc1[accept в proc1]
+    fd2 --> acc2[accept в proc2]
+    fd3 --> acc3[accept в proc3]
+    fd4 --> acc4[accept в proc4]
 ```
 
 Преимущества:

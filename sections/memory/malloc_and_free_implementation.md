@@ -175,7 +175,7 @@ malloc_state (arena)
 │ flags                            │
 │ top           ──▶ top chunk      │
 │ fastbinsY[10] ──▶ fastbin lists  │
-│ bins[254]     ──▶ small/largebins│
+│ bins[128]     ──▶ small/largebins│
 │ next          ──▶ следующая arena│
 └──────────────────────────────────┘
 ```

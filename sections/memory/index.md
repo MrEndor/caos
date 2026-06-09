@@ -21,3 +21,5 @@ coalescing).
 | [mmap и маппинг файлов](mmap_and_file_mapping.md)                | Системный вызов `mmap`: анонимная память, файловые отображения, `MAP_SHARED` vs `MAP_PRIVATE`, `msync`, `mremap`, `MAP_FIXED`                    |
 | [Защита памяти](memory_protection.md)                            | `mprotect`, принцип W^X, NX-бит, ASLR, `SIGSEGV` и `SIGILL`, загрузка кода через `mmap`                                                          |
 | [Реализация malloc и free](malloc_and_free_implementation.md)    | Структура chunk, bins (fastbins, smallbins, largebins, unsorted bin), алгоритмы `malloc` и `free`, коалесценция, `brk` vs `mmap` в куче glibc    |
+| [Page cache](page_cache.md)                                      | Кэш страниц файлов в RAM, `address_space`, dirty pages и writeback, readahead, `fadvise`/`madvise`, `O_DIRECT`, `fsync`/`fdatasync`, drop_caches |
+| [NUMA](numa.md)                                                  | Non-Uniform Memory Access, local vs remote latency, memory policies, `numactl`/`mbind`/`move_pages`, auto-balancing, NUMA-aware аллокаторы       |

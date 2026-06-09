@@ -129,27 +129,15 @@ inet_ntop(AF_INET, &ipv4, buf, sizeof(buf)); // 4 байта → "192.168.1.1"
 
 ## Жизненный цикл сервера
 
-```
-   socket()        bind()          listen()         accept()
-      │              │                │                │
-      ▼              ▼                ▼                ▼
-  ┌───────┐     ┌────────┐      ┌──────────┐     ┌──────────┐
-  │ alloc │ ──▶ │ bind   │ ───▶ │ backlog  │ ──▶ │ блокир., │
-  │  fd   │     │ addr + │      │ queue    │     │ ждём SYN │
-  │ + sb  │     │ port   │      │ allocate │     │          │
-  └───────┘     └────────┘      └──────────┘     └────┬─────┘
-                                                      │
-                                                      ▼
-                                                ┌──────────────┐
-                                                │ new client_fd│
-                                                │ для каждого  │
-                                                │ соединения   │
-                                                └──────┬───────┘
-                                                       │
-                                       ┌───────────────┼───────────────┐
-                                       ▼               ▼               ▼
-                                  recv/send       recv/send         close()
-                                    loop            loop          (client_fd)
+```mermaid
+flowchart LR
+    socket["socket()<br/>alloc fd + sb"] --> bind["bind()<br/>addr + port"]
+    bind --> listen["listen()<br/>backlog queue allocate"]
+    listen --> accept["accept()<br/>блокир., ждём SYN"]
+    accept --> client["new client_fd<br/>для каждого соединения"]
+    client --> loop1["recv/send loop"]
+    client --> loop2["recv/send loop"]
+    client --> closec["close(client_fd)"]
 ```
 
 **`socket()`** — kernel выделяет `struct socket`, `struct sock` (TCP-специфичный control block) и регистрирует fd в
@@ -170,17 +158,22 @@ handshake) и accept queue (полностью установленные, жд�
 
 ## Жизненный цикл клиента
 
-```
-   socket()         connect()              send/recv loop          close()
-      │                │                          │                   │
-      ▼                ▼                          ▼                   ▼
-  ┌───────┐      ┌──────────┐               ┌──────────┐         ┌────────┐
-  │ alloc │ ───▶ │ 3-way    │ ────────────▶ │ обмен    │ ──────▶ │ FIN +  │
-  │  fd   │      │ handshake│               │ данными  │         │ TIME_  │
-  │       │      │ SYN/     │               │          │         │ WAIT   │
-  │       │      │ SYN-ACK/ │               │          │         │        │
-  │       │      │ ACK      │               │          │         │        │
-  └───────┘      └──────────┘               └──────────┘         └────────┘
+```mermaid
+sequenceDiagram
+    participant App as client app
+    participant Kernel as kernel
+    participant Server as server
+    App->>Kernel: socket() — alloc fd
+    App->>Kernel: connect()
+    Kernel->>Server: SYN
+    Server->>Kernel: SYN+ACK
+    Kernel->>Server: ACK
+    Note over App,Server: 3-way handshake complete, ESTABLISHED
+    App->>Server: send() / recv() — обмен данными
+    Server->>App: send() / recv()
+    App->>Kernel: close()
+    Kernel->>Server: FIN
+    Note over App: TIME_WAIT
 ```
 
 `connect()` для TCP инициирует 3-way handshake (SYN → SYN-ACK → ACK) и возвращается, когда соединение установлено. Если
@@ -275,6 +268,14 @@ int main(void) {
   получим `EPIPE` из `send`.
 - Это **однопоточный** сервер: пока обрабатываем одного клиента, остальные ждут в accept queue. Для масштабирования —
   `fork`, threads или `epoll` (см. связанные темы).
+
+!!! example "Рабочий пример"
+    Полные компилируемые реализации TCP echo-сервера и клиента:
+
+    - sync-сервер: `examples/q01_sync_tcp_server/server.c`
+    - thread-per-connection сервер + клиент: `examples/q02_threaded_tcp/server.c` + `client.c`
+
+    Собрать и запустить: `cd examples && make q01 q02 && ./bin/q01_sync_tcp_server`
 
 Компиляция и запуск:
 

@@ -61,6 +61,8 @@ nav:
     - "Формат ELF": linking_and_libraries/elf_format.md
     - "Символы и манглирование": linking_and_libraries/symbols_and_mangling.md
     - "Запуск и завершение программы": linking_and_libraries/program_startup_shutdown.md
+    - "Динамический линковщик (ld.so) изнутри": linking_and_libraries/dynamic_linker.md
+    - "PLT/GOT и lazy binding": linking_and_libraries/plt_got.md
   - "Файлы и файловые системы":
     - Обзор раздела: files_and_filesystems/index.md
     - "Файловые дескрипторы": files_and_filesystems/file_descriptors.md
@@ -72,6 +74,13 @@ nav:
     - "Права доступа и атрибуты": files_and_filesystems/file_permissions_and_attributes.md
     - "Открытые файлы и процессы": files_and_filesystems/open_files_and_processes.md
     - "Блочные и символьные устройства": files_and_filesystems/block_and_character_devices.md
+    - "OverlayFS и слои Docker": files_and_filesystems/overlayfs.md
+    - "Linux block layer": files_and_filesystems/block_layer.md
+    - "Внутреннее устройство ФС": files_and_filesystems/filesystem_internals.md
+    - "FUSE: filesystem в userspace": files_and_filesystems/fuse.md
+    - "inotify и fanotify": files_and_filesystems/inotify_fanotify.md
+    - "NVMe и SPDK": files_and_filesystems/nvme_spdk.md
+    - "ZFS и Btrfs": files_and_filesystems/zfs_btrfs.md
   - "Память":
     - Обзор раздела: memory/index.md
     - "Виртуальная память": memory/virtual_memory.md
@@ -79,6 +88,8 @@ nav:
     - "mmap и маппинг файлов": memory/mmap_and_file_mapping.md
     - "Защита памяти": memory/memory_protection.md
     - "Реализация malloc и free": memory/malloc_and_free_implementation.md
+    - "Page cache": memory/page_cache.md
+    - "NUMA": memory/numa.md
   - "Процессы":
     - Обзор раздела: processes/index.md
     - "Основы процессов": processes/processes_basics.md
@@ -89,18 +100,44 @@ nav:
     - "Сигналы": processes/signals.md
     - "IPC: Pipes, FIFO, Shared memory": processes/ipc.md
     - "Context switch (kernel)": processes/context_switch.md
-  - "Потоки и concurrency":
-    - Обзор раздела: threads/index.md
-    - "Потоки (основы)": threads/threads_basics.md
-    - "Реализация потоков (clone)": threads/thread_implementation_clone.md
-    - "Синхронизация: мьютексы, семафоры, futex": threads/thread_synchronization.md
-    - "Atomic операции и memory model": threads/atomics_and_memory_model.md
-    - "setjmp/longjmp и ucontext": threads/userspace_context_switching.md
+  - "Concurrency":
+    - Обзор раздела: concurrency/index.md
+    - "Потоки (основы)": concurrency/threads_basics.md
+    - "Реализация потоков (clone)": concurrency/thread_implementation_clone.md
+    - "Синхронизация: мьютексы, семафоры, futex": concurrency/thread_synchronization.md
+    - "C++ примитивы синхронизации": concurrency/sync_primitives_cpp.md
+    - "Thread pool": concurrency/thread_pool.md
+    - "Atomic операции и memory model": concurrency/atomics_and_memory_model.md
+    - "Lock-free структуры": concurrency/lock_free_structures.md
+    - "TCP servers: эволюция моделей": concurrency/tcp_servers.md
+    - "Future и Promise": concurrency/future_promise.md
+    - "setjmp/longjmp и ucontext": concurrency/userspace_context_switching.md
+    - "Fibers: stackful coroutines": concurrency/fibers.md
+    - "C++20 coroutines (stackless)": concurrency/coroutines_cpp20.md
+  - "Boot и init":
+    - Обзор раздела: boot_and_init/index.md
+    - "Загрузка системы: от UEFI до init": boot_and_init/boot_process.md
+    - "systemd: init и process manager": boot_and_init/systemd.md
   - "Изоляция и контейнеры":
     - Обзор раздела: isolation/index.md
     - "seccomp": isolation/seccomp.md
     - "Linux namespaces": isolation/namespaces.md
     - "cgroups: углублённо": isolation/cgroups.md
+    - "Внутреннее устройство контейнеров": isolation/containers_internals.md
+    - "AppArmor и SELinux": isolation/apparmor_selinux.md
+  - "Виртуализация":
+    - Обзор раздела: virtualization/index.md
+    - "Основы виртуализации": virtualization/foundations.md
+    - "CPU virtualization": virtualization/cpu_virtualization.md
+    - "Memory virtualization": virtualization/memory_virtualization.md
+    - "KVM API": virtualization/kvm_api.md
+    - "QEMU internals": virtualization/qemu_internals.md
+    - "virtio": virtualization/virtio.md
+    - "I/O passthrough": virtualization/io_passthrough.md
+    - "Live migration": virtualization/live_migration.md
+    - "Nested virtualization": virtualization/nested_virtualization.md
+    - "MicroVMs": virtualization/microvms.md
+    - "Confidential Computing": virtualization/confidential_computing.md
   - "Ассемблер и процессор":
     - Обзор раздела: assembler_and_processor/index.md
     - "Основы ассемблера": assembler_and_processor/assembler_basics.md
@@ -123,7 +160,15 @@ nav:
     - "TCP и UDP: протоколы и тонкости": networking/tcp_udp.md
     - "I/O multiplexing (select, poll, epoll)": networking/io_multiplexing.md
     - "io_uring": networking/io_uring.md
+    - "Сетевой стек Linux изнутри": networking/network_stack_internals.md
+    - "netfilter, iptables, nftables, conntrack": networking/netfilter_iptables.md
   - "Инструменты и отладка":
     - Обзор раздела: tools_and_debugging/index.md
     - "Отладка (GDB, sanitizers, perf, strace)": tools_and_debugging/debugging.md
     - "ptrace: process tracing изнутри": tools_and_debugging/ptrace.md
+  - "eBPF":
+    - Обзор раздела: ebpf/index.md
+    - "Основы eBPF": ebpf/foundations.md
+    - "eBPF tracing": ebpf/tracing.md
+    - "eBPF в сетевом стеке": ebpf/networking.md
+    - "eBPF для безопасности": ebpf/security.md

@@ -28,49 +28,43 @@
 Механизм перехода из user mode в kernel mode и обратно:
 
 ```
- User space (ring 3)                   Kernel space (ring 0)
- ─────────────────────────             ─────────────────────────────────────────
+  User space (Ring 3)                  Kernel space (Ring 0)
+  ─────────────────────────────        ──────────────────────────────────────
+  write(1, buf, n)
+        │
+        ▼
+  libc wrapper:
+    rax = 1          ; SYS_write
+    rdi = 1          ; fd = stdout
+    rsi = buf
+    rdx = n
+    syscall  ────────────────────────▶ CPU аппаратно:
+                                         rcx ← rip   (адрес возврата)
+                                         r11 ← rflags
+                                         CS/SS ← Ring 0 selectors
+                                         rip ← MSR_LSTAR
 
- Программа вызывает write(1, buf, n)
+                                       ┌────────────────────────────────┐
+                                       │ entry_SYSCALL_64 (asm)         │
+                                       │   swapgs                       │
+                                       │   переключить на kernel stack  │
+                                       │   push pt_regs (все регистры)  │
+                                       │   проверить rax < NR_syscalls  │
+                                       │   call sys_write(rdi, rsi, rdx)│
+                                       │   pop  pt_regs                 │
+                                       │   rax ← результат / -errno     │
+                                       └────────────────────────────────┘
+
+                                       sysretq
+        ◀────────────────────────────    CPL: 0 → 3
+                                         rip    ← rcx
+                                         rflags ← r11
+  libc: возврат rax
+    rax < 0  →  errno = -rax; return -1
+    иначе    →  return rax  (число записанных байт)
         │
         ▼
- libc: write()  — обёртка
-   rax = 1          ← номер syscall (SYS_write)
-   rdi = 1          ← fd = stdout
-   rsi = buf        ← указатель на буфер
-   rdx = n          ← количество байт
-        │
-        │  инструкция syscall
-        │  CPU сохраняет rip → rcx
-        │  CPU сохраняет rflags → r11
-        │  переключает CS/SS на ring 0 сегменты
-        │  переходит по адресу из MSR_LSTAR
-        ▼
-                                  entry_SYSCALL_64 (ядро)
-                                        │
-                                        │  сохраняет регистры пользователя
-                                        │  (pt_regs на kernel stack)
-                                        │
-                                        │  проверяет rax < NR_syscalls
-                                        │
-                                        │  вызывает sys_write(rdi, rsi, rdx)
-                                        │  ──▶ обрабатывает запись в файл
-                                        │
-                                        │  результат → rax
-                                        │
-                                        │  восстанавливает регистры пользователя
-                                        │
-                                        │  инструкция sysret
-                                        │  rip ← rcx  (адрес возврата)
-                                        │  rflags ← r11
-                                        │  переключает CS/SS обратно на ring 3
-                                        ▼
- libc: write() возвращает rax
- (число записанных байт или -1 при ошибке,
-  libc конвертирует отрицательный rax в errno)
-        │
-        ▼
- Программа продолжает выполнение
+  Программа продолжает
 ```
 
 Ключевые особенности `syscall`/`sysret` (в отличие от прерывания `int 0x80`):

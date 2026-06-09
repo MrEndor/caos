@@ -72,16 +72,22 @@ controllers, нужные в практике, есть в v2.
 содержать процессы напрямую** — только в листьях. Это исключает двусмысленность («чьим лимитам подчиняется процесс в
 промежуточном узле — своим или дочерним?»). Root cgroup — единственное исключение.
 
-```
-ПРАВИЛЬНО                            НЕПРАВИЛЬНО
-
-       root                                root
-        │ subtree_control: cpu              │ subtree_control: cpu
-   ┌────┴────┐                          ┌───┴────┐
-   │ web/    │ ← листья,                │ app/   │  ← есть subtree_control,
-   │ db/     │   содержат PIDs          │ PID 5  │ ✗   не может
-   └─────────┘                          └────────┘     содержать PID
-                                        EBUSY при echo 5 > cgroup.procs
+```mermaid
+graph TB
+    subgraph OK["ПРАВИЛЬНО"]
+        R1["root<br/>subtree_control: cpu"]
+        W["web/<br/>(лист, PIDs)"]
+        D["db/<br/>(лист, PIDs)"]
+        R1 --> W
+        R1 --> D
+    end
+    subgraph NO["НЕПРАВИЛЬНО"]
+        R2["root<br/>subtree_control: cpu"]
+        A["app/<br/>subtree_control включён<br/>не может содержать PID<br/>EBUSY при echo 5 > cgroup.procs"]
+        P["PID 5 ✗"]
+        R2 --> A
+        A -.- P
+    end
 ```
 
 ### Иерархия systemd
@@ -202,30 +208,17 @@ cache, запускает writeback на dirty, по возможности — 
 OOM-killer**: выбирается жертва **только из процессов этой cgroup**, не глобально. Это критическое отличие: OOM в одном
 контейнере не убивает соседа.
 
-```
-memory.current                                  memory.max
-     │                                              │
-     ▼                                              ▼
-┌─────────────────────────────────────┬──────────────┐
-│ anon │ file │ sock │ slab │ shmem   │  reclaim     │
-└─────────────────────────────────────┴──────────────┘
-                                              │
-                                              ▼
-                                      выкинули чистый
-                                      page cache
-                                              │
-                                              ▼
-                                      memory.events.max++
-                                              │
-                                              ▼
-                                      не помогло?
-                                              │
-                                              ▼
-                                      OOM-killer выбирает
-                                      жертву из cgroup.procs
-                                              │
-                                              ▼
-                                      memory.events.oom_kill++
+```mermaid
+flowchart TB
+    USAGE["memory.current<br/>anon / file / sock / slab / shmem"]
+    LIMIT["memory.max превышен"]
+    REC["reclaim: выкинули чистый page cache"]
+    EV1["memory.events.max++"]
+    Q{"не помогло?"}
+    OOM["OOM-killer выбирает жертву<br/>из cgroup.procs"]
+    EV2["memory.events.oom_kill++"]
+    USAGE --> LIMIT --> REC --> EV1 --> Q
+    Q -->|да| OOM --> EV2
 ```
 
 `memory.oom.group=1` превращает cgroup-local OOM в «убить всю группу». Полезно для services, где смерть одного процесса
@@ -395,10 +388,12 @@ Task 2: │  run  │      wait        │   run   │   wait   │   run      �
         ├────────────────────────────────────────────────────────────┤
 Task 3: │   run    │   wait   │      run     │   wait   │    run     │
         └────────────────────────────────────────────────────────────┘
-              │      │            │       │       │
-              │      └─ some=1    │       │       └─ some=0
-              │                   │       └─ full=1 (ВСЕ ждут)
-              └─ some=0           └─ some=1
+           │        │                   │             │           │
+           │        │                   │             │           └─ some=0
+           │        │                   │             └─ full=1 (все ждут)
+           │        │                   └─ some=1 (только T1 в wait)
+           │        └─ full=1 (все ждут)
+           └─ some=0 (все работают)
 ```
 
 ### Применение

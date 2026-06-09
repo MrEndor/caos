@@ -25,23 +25,19 @@ Namespaces — механизм ядра Linux, изолирующий то, ч�
 Флаг `CLONE_NEWNS` назван так, потому что это был **самый первый** namespace в Linux (mount) — тогда слово «namespace»
 ещё не было общим термином. Все остальные флаги начинаются с `CLONE_NEW<имя>`.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  один Linux kernel, одна машина                 │
-│                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │
-│  │   контейнер A    │  │   контейнер B    │  │     host      │  │
-│  │ ─────────────────│  │ ─────────────────│  │ ──────────────│  │
-│  │ mnt:  своё /     │  │ mnt:  своё /     │  │ mnt:  /       │  │
-│  │ pid:  init=1     │  │ pid:  init=1     │  │ pid:  systemd │  │
-│  │ net:  eth0=10... │  │ net:  eth0=10... │  │ net:  eth0,wl │  │
-│  │ uts:  app-1      │  │ uts:  db-2       │  │ uts:  worksta │  │
-│  │ user: root↔1000  │  │ user: root↔1001  │  │ user: real    │  │
-│  │ ipc:  своя SysV  │  │ ipc:  своя SysV  │  │ ipc:  общий   │  │
-│  │ cgrp: /          │  │ cgrp: /          │  │ cgrp: реальный│  │
-│  │ time: своё mono  │  │ time: своё mono  │  │ time: реальное│  │
-│  └──────────────────┘  └──────────────────┘  └───────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph K["один Linux kernel, одна машина"]
+        subgraph A["контейнер A"]
+            A1["mnt: своё /<br/>pid: init=1<br/>net: eth0=10...<br/>uts: app-1<br/>user: root↔1000<br/>ipc: своя SysV<br/>cgrp: /<br/>time: своё mono"]
+        end
+        subgraph B["контейнер B"]
+            B1["mnt: своё /<br/>pid: init=1<br/>net: eth0=10...<br/>uts: db-2<br/>user: root↔1001<br/>ipc: своя SysV<br/>cgrp: /<br/>time: своё mono"]
+        end
+        subgraph H["host"]
+            H1["mnt: /<br/>pid: systemd<br/>net: eth0, wl<br/>uts: workstation<br/>user: real<br/>ipc: общий<br/>cgrp: реальный<br/>time: реальное"]
+        end
+    end
 ```
 
 Namespaces ортогональны cgroups. Namespaces отвечают на вопрос «**что видит** процесс», cgroups — «**сколько ресурсов**
@@ -176,38 +172,24 @@ Mount ns изолирует **список mount points**, видимый про
 | `MS_SLAVE`      | `--make-slave`      | принимает события от master, свои не отдаёт |
 | `MS_UNBINDABLE` | `--make-unbindable` | как private + нельзя bind-mount'ить         |
 
-```
-shared propagation (default в systemd):
-
-  host mount ns                    container mount ns
-  ┌──────────────────┐             ┌──────────────────┐
-  │ /                │             │ /                │
-  │ /home            │ ◀──────────▶│ /home            │
-  │ /mnt/usb (new) ──┼────────────▶│ /mnt/usb (auto)  │
-  └──────────────────┘             └──────────────────┘
-        mount событие распространяется в обе стороны
-
-
-slave propagation (рекомендуется для контейнеров):
-
-  host mount ns                    container mount ns
-  ┌──────────────────┐             ┌──────────────────┐
-  │ /                │             │ /                │
-  │ /home            │ ────────────▶│ /home (copy)    │
-  │ /mnt/usb (new) ──┼────────────▶│ /mnt/usb (auto)  │
-  │                  │             │ /private (new)   │  ◀── не уйдёт в host
-  └──────────────────┘             └──────────────────┘
-        host → container: да    container → host: нет
-
-
-private propagation:
-
-  host mount ns                    container mount ns
-  ┌──────────────────┐             ┌──────────────────┐
-  │ /                │             │ /                │
-  │ /mnt/usb (new) ──┤             ├── /private (new) │
-  └──────────────────┘             └──────────────────┘
-        полная независимость, никакая сторона не видит изменений другой
+```mermaid
+flowchart LR
+    subgraph SH["shared propagation (default в systemd)"]
+        SH_H["host mount ns:<br/>/, /home, /mnt/usb (new)"]
+        SH_C["container mount ns:<br/>/, /home, /mnt/usb (auto)"]
+        SH_H <-->|"mount событие в обе стороны"| SH_C
+    end
+    subgraph SL["slave propagation (для контейнеров)"]
+        SL_H["host mount ns:<br/>/, /home, /mnt/usb (new)"]
+        SL_C["container mount ns:<br/>/, /home (copy), /mnt/usb (auto),<br/>/private (new) — не уйдёт в host"]
+        SL_H -->|"host → container: да"| SL_C
+        SL_C -.->|"container → host: нет"| SL_H
+    end
+    subgraph PR["private propagation"]
+        PR_H["host mount ns:<br/>/, /mnt/usb (new)"]
+        PR_C["container mount ns:<br/>/, /private (new)"]
+        PR_H -.- PR_C
+    end
 ```
 
 До ядра 2.6.15 любой mount в новом mount ns был приватным, и Docker bind-mount'ы из host'а внутрь контейнера не
@@ -235,15 +217,15 @@ ls /tmp                  # → file
 монтируется в новый mount ns, делается `pivot_root` в него, старый корень отмонтируется. После этого процесс физически
 не может «вылезти» — старого корня уже нет в mount table.
 
-```
-runc создаёт контейнер:
-
-  1. unshare(CLONE_NEWNS)                                — свой mount ns
-  2. mount("rootfs.ext4", "/var/run/runc/abc/rootfs")    — образ как новый /
-  3. mount --rbind /proc, /sys, /dev, /tmp               — заполнить
-  4. pivot_root("/var/run/runc/abc/rootfs", ".old")      — атомарный swap
-  5. umount(".old", MNT_DETACH)                          — отрезать прошлое
-  6. chdir("/")                                          — корень установлен
+```mermaid
+flowchart TB
+    R1["1. unshare(CLONE_NEWNS) — свой mount ns"]
+    R2["2. mount('rootfs.ext4', '/var/run/runc/abc/rootfs')<br/>— образ как новый /"]
+    R3["3. mount --rbind /proc, /sys, /dev, /tmp — заполнить"]
+    R4["4. pivot_root('/var/run/runc/abc/rootfs', '.old')<br/>— атомарный swap"]
+    R5["5. umount('.old', MNT_DETACH) — отрезать прошлое"]
+    R6["6. chdir('/') — корень установлен"]
+    R1 --> R2 --> R3 --> R4 --> R5 --> R6
 ```
 
 ## PID namespace
@@ -251,21 +233,24 @@ runc создаёт контейнер:
 Внутри PID ns нумерация процессов начинается с 1. Первый процесс ns становится **init процессом** этого ns: он получает
 PID 1, наследует обязанности reaper'а зомби и обработки сигналов от ядра.
 
-```
-host PID namespace                  container PID namespace
-┌──────────────────────────┐
-│ PID 1   systemd          │
-│ PID 832 dockerd          │
-│ PID 2001 containerd-shim │
-│ PID 2050 nginx ──────────┼──── тот же процесс ────┐
-│ PID 2052 worker1 ────────┼─── те же процессы ─────┤
-│ PID 2053 worker2 ────────┼────────────────────────┤
-└──────────────────────────┘                        ▼
-                                    ┌──────────────────────────┐
-                                    │ PID 1 nginx              │
-                                    │ PID 2 worker1            │
-                                    │ PID 3 worker2            │
-                                    └──────────────────────────┘
+```mermaid
+graph LR
+    subgraph H["host PID namespace"]
+        H1["PID 1 systemd"]
+        H2["PID 832 dockerd"]
+        H3["PID 2001 containerd-shim"]
+        H4["PID 2050 nginx"]
+        H5["PID 2052 worker1"]
+        H6["PID 2053 worker2"]
+    end
+    subgraph C["container PID namespace"]
+        C1["PID 1 nginx"]
+        C2["PID 2 worker1"]
+        C3["PID 3 worker2"]
+    end
+    H4 -->|тот же процесс| C1
+    H5 -->|тот же процесс| C2
+    H6 -->|тот же процесс| C3
 ```
 
 Один и тот же процесс имеет **разные PID** в разных namespaces — это PID translation, его делает ядро при чтении
@@ -287,24 +272,13 @@ reap'ать зомби и плохо обрабатывает сигналы. Р
 PID ns могут быть вложенными. Процесс в N-ом вложенном ns имеет N+1 PID: по одному в каждом ns выше плюс свой
 собственный.
 
-```
-        host ns
-        ┌──────────────────┐
-        │ PID 3000         │ ◀──── видно везде выше
-        └──────┬───────────┘
-               │
-        container ns (level 1)
-        ┌──────▼───────────┐
-        │ PID 42    ◀──── видно в L1 и host
-        └──────┬───────────┘
-               │
-        sandbox ns (level 2, внутри L1)
-        ┌──────▼───────────┐
-        │ PID 1     ◀──── это «настоящий» PID для процесса
-        └──────────────────┘
-
-один процесс — три разных PID:
-  NSpid: 3000 42 1
+```mermaid
+graph TB
+    H["host ns<br/>PID 3000 — видно везде выше"]
+    L1["container ns (level 1)<br/>PID 42 — видно в L1 и host"]
+    L2["sandbox ns (level 2, внутри L1)<br/>PID 1 — 'настоящий' PID для процесса"]
+    H --> L1 --> L2
+    NS["один процесс — три разных PID:<br/>NSpid: 3000 42 1"]
 ```
 
 Процесс из родительского ns может слать сигналы процессам в дочернем (по их PID в родительском ns), но не наоборот.
@@ -328,16 +302,22 @@ $ cat /proc/$$/uid_map
 Преобразование двустороннее. Когда процесс из user ns создаёт файл, на диск пишется его **снаружный** UID. Когда читает
 ownership файла — ядро транслирует обратно.
 
-```
-inside user ns                         outside (host)
-┌──────────────────┐                   ┌──────────────────┐
-│ UID 0   (root)   │  ──── mapping ──▶ │ UID 1000 (egor)  │
-│ UID 1   (daemon) │  ──── mapping ──▶ │ UID 100001       │
-│ UID 1000 (app)   │  ──── mapping ──▶ │ UID 101000       │
-└──────────────────┘                   └──────────────────┘
-
-  touch /tmp/file                      ls -l /tmp/file
-  → owner: root (UID 0)                → owner: egor (UID 1000)
+```mermaid
+graph LR
+    subgraph IN["inside user ns"]
+        I1["UID 0 (root)"]
+        I2["UID 1 (daemon)"]
+        I3["UID 1000 (app)"]
+    end
+    subgraph OUT["outside (host)"]
+        O1["UID 1000 (egor)"]
+        O2["UID 100001"]
+        O3["UID 101000"]
+    end
+    I1 -->|mapping| O1
+    I2 -->|mapping| O2
+    I3 -->|mapping| O3
+    N["touch /tmp/file → owner: root (UID 0) внутри<br/>ls -l /tmp/file → owner: egor (UID 1000) снаружи"]
 ```
 
 ### Capabilities в user ns
@@ -397,16 +377,16 @@ sudo ip netns exec ns1 ip link
 Чтобы соединить netns с внешним миром, ядро предоставляет **veth (virtual ethernet)** — пару виртуальных интерфейсов,
 соединённых трубой: всё, что записано на один конец, выходит на другом.
 
-```
-host netns                                  container netns
-┌─────────────────────┐                     ┌─────────────────────┐
-│                     │                     │                     │
-│    veth0 ◀══════════│═════════════════════│══════════▶ veth1    │
-│ 192.168.1.1/24      │     виртуальная     │  192.168.1.2/24     │
-│                     │       труба         │                     │
-└─────────────────────┘                     └─────────────────────┘
-
-  ping 192.168.1.2  ──▶  пакет ──▶ veth0 ──▶ veth1 ──▶ доставка
+```mermaid
+graph LR
+    subgraph H["host netns"]
+        V0["veth0<br/>192.168.1.1/24"]
+    end
+    subgraph C["container netns"]
+        V1["veth1<br/>192.168.1.2/24"]
+    end
+    V0 <-->|"виртуальная труба"| V1
+    P["ping 192.168.1.2 → пакет → veth0 → veth1 → доставка"]
 ```
 
 ### Bridge
@@ -414,30 +394,30 @@ host netns                                  container netns
 Когда контейнеров много, у каждого свой veth pair, и все нужно объединить в подсеть. Решение — **bridge** (виртуальный
 коммутатор) на host'е. Docker создаёт bridge `docker0`, и host-конец каждого veth подключается к нему.
 
-```
-                  host netns
-        ┌─────────────────────────────────┐
-        │     bridge docker0 (10.0.0.1)   │
-        │     ┌──────┬──────┬──────┐      │
-        │     │veth0a│veth0b│veth0c│      │
-        │     └───╥──┴───╥──┴───╥──┘      │
-        └─────────╫──────╫──────╫─────────┘
-                  ║      ║      ║
-       veth pair  ║      ║      ║
-                  ║      ║      ║
-        ┌─────────╨───┐ ╔╝   ┌──╨──────────┐
-        │  container1 │ ║    │  container3 │
-        │ veth1       │ ║    │ veth3       │
-        │ 10.0.0.2    │ ║    │ 10.0.0.4    │
-        └─────────────┘ ║    └─────────────┘
-                        ║
-              ┌─────────╨───┐
-              │  container2 │
-              │ veth2       │
-              │ 10.0.0.3    │
-              └─────────────┘
-
-bridge коммутирует L2-фреймы между всеми contained'ами + uplink через NAT
+```mermaid
+graph TB
+    subgraph H["host netns"]
+        BR["bridge docker0 (10.0.0.1)"]
+        V0a[veth0a]
+        V0b[veth0b]
+        V0c[veth0c]
+        BR --- V0a
+        BR --- V0b
+        BR --- V0c
+    end
+    subgraph C1["container1"]
+        V1["veth1<br/>10.0.0.2"]
+    end
+    subgraph C2["container2"]
+        V2["veth2<br/>10.0.0.3"]
+    end
+    subgraph C3["container3"]
+        V3["veth3<br/>10.0.0.4"]
+    end
+    V0a <-->|veth pair| V1
+    V0b <-->|veth pair| V2
+    V0c <-->|veth pair| V3
+    N["bridge коммутирует L2-фреймы между всеми contained'ами + uplink через NAT"]
 ```
 
 ### Пример: ручная сборка netns с veth
@@ -501,39 +481,20 @@ host'а. Часто создаётся **последним**, уже после
 Когда `docker run` или `podman run` запускает контейнер, под капотом исполняется примерно такая последовательность.
 Реальный контейнер собирает runc/crun по OCI runtime spec.
 
-```
-runc create:
-
-  1. clone(CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWNET|
-           CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWUSER)
-       └─ ребёнок появляется во всех новых namespaces сразу
-
-  2. в ребёнке:
-       a. write /proc/self/uid_map   ◀── установить user mapping
-          write /proc/self/gid_map
-          (perm на gid_map требует /proc/self/setgroups = "deny")
-
-       b. mount("/", "/", MS_PRIVATE|MS_REC)        — отрезать propagation от host
-          mount(image_rootfs, "/run/rootfs", BIND)  — образ как новый /
-
-       c. mount tmpfs, proc, sysfs, devpts, mqueue в новый rootfs
-          mount --rbind /dev/null /dev/null  и т.п.
-
-       d. pivot_root("/run/rootfs", "/run/rootfs/.old")
-          umount("/run/rootfs/.old", MNT_DETACH)
-          chdir("/")
-
-       e. unshare(CLONE_NEWCGROUP)   — корень cgroup стал контейнерным
-
-       f. sethostname("container-id")
-          set rlimits, oom_score_adj
-
-       g. apply seccomp filter
-          drop capabilities (keep только minimal set)
-
-       h. setgroups, setgid, setuid в маппированный «root внутри ns»
-
-       i. execve("/entrypoint")
+```mermaid
+sequenceDiagram
+    participant Parent as runc parent
+    participant Child as runc child
+    Parent->>Child: 1. clone(CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWNET|<br/>CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWUSER)<br/>(ребёнок появляется во всех новых namespaces сразу)
+    Note over Child: 2a. write /proc/self/uid_map, gid_map<br/>(perm требует setgroups='deny')
+    Note over Child: 2b. mount('/', '/', MS_PRIVATE|MS_REC) — отрезать propagation<br/>mount(image_rootfs, '/run/rootfs', BIND) — образ как новый /
+    Note over Child: 2c. mount tmpfs, proc, sysfs, devpts, mqueue в новый rootfs<br/>mount --rbind /dev/null /dev/null и т.п.
+    Note over Child: 2d. pivot_root('/run/rootfs', '/run/rootfs/.old')<br/>umount('/run/rootfs/.old', MNT_DETACH); chdir('/')
+    Note over Child: 2e. unshare(CLONE_NEWCGROUP) — корень cgroup стал контейнерным
+    Note over Child: 2f. sethostname('container-id'); set rlimits, oom_score_adj
+    Note over Child: 2g. apply seccomp filter; drop capabilities (keep minimal set)
+    Note over Child: 2h. setgroups, setgid, setuid в маппированный 'root внутри ns'
+    Note over Child: 2i. execve('/entrypoint')
 ```
 
 Параллельно cgroup-контроллер на хосте помещает PID контейнера в нужный cgroup с лимитами CPU/memory.
@@ -590,7 +551,7 @@ machinectl shell <name>
 
 - [cgroups: углублённо](cgroups.md) — ограничение ресурсов; namespaces изолируют видимость, cgroups — потребление
 - [fork и exec](../processes/fork_and_exec.md) — `clone(2)` с флагами `CLONE_NEW*`, на котором всё построено
-- [Реализация потоков (clone)](../threads/thread_implementation_clone.md) — другие флаги `CLONE_*` для разделения
+- [Реализация потоков (clone)](../concurrency/thread_implementation_clone.md) — другие флаги `CLONE_*` для разделения
   адресного пространства, FS, файлов
 - [seccomp](seccomp.md) — фильтр syscall'ов, комбинируется с namespaces в каждом контейнере
 - [Приоритеты, affinity, capabilities](../processes/process_priority_affinity_capabilities.md) — capabilities внутри

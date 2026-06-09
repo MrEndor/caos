@@ -23,22 +23,19 @@ Multiplexing использует тот факт, что подавляющее
 вызывает single syscall, передавая список интересующих fd. Kernel блокирует поток до тех пор, пока хотя бы один fd не
 станет ready, и возвращает управление с информацией о готовых fd. Никаких лишних потоков, никакого busy-wait.
 
-```
-Thread-per-connection                  I/O multiplexing
-┌─────────┐   ┌─────────┐               ┌──────────────────┐
-│ thread1 │──▶│   fd1   │               │   single thread  │
-├─────────┤   ├─────────┤               │                  │
-│ thread2 │──▶│   fd2   │               │  epoll_wait()    │
-├─────────┤   ├─────────┤               │       │          │
-│ thread3 │──▶│   fd3   │               │       ▼          │
-├─────────┤   ├─────────┤               │  fd1, fd17, fd42 │
-│   ...   │──▶│   ...   │               │   готовы         │
-├─────────┤   ├─────────┤               └────────┬─────────┘
-│threadN  │──▶│  fdN    │                        │
-└─────────┘   └─────────┘                ┌───────┴────────┐
-  N стеков     N fd                      │ fd1 fd2 ... fdN│
-  N mutex'ов                             │  watch list    │
-                                         └────────────────┘
+```mermaid
+flowchart LR
+    subgraph TPC["Thread-per-connection"]
+        t1[thread1] --> f1[fd1]
+        t2[thread2] --> f2[fd2]
+        t3[thread3] --> f3[fd3]
+        tn[threadN] --> fn[fdN]
+    end
+    subgraph MUX["I/O multiplexing"]
+        single[single thread] --> ew["epoll_wait()"]
+        ew --> ready["fd1, fd17, fd42 готовы"]
+        wl["watch list: fd1 fd2 ... fdN"] -.- ew
+    end
 ```
 
 ## select
@@ -233,6 +230,206 @@ epoll instance (kernel)
 Это и есть ключевое отличие от select/poll: kernel не сканирует все fd, а получает уведомления только об активных.
 Размер interest list может быть миллион — `epoll_wait` всё равно вернётся за микросекунды, если активных fd десяток.
 
+### epoll internals в ядре
+
+Реализация — `fs/eventpoll.c` в kernel tree. Каждый epoll instance представлен структурой `struct eventpoll`:
+
+```
+struct eventpoll {
+   spinlock_t        lock;       ──▶  защищает rdllist и wq
+   struct mutex      mtx;        ──▶  защищает rbr (interest list)
+   wait_queue_head_t wq;         ──▶  waiters в epoll_wait
+   wait_queue_head_t poll_wait;  ──▶  для случая «epoll в epoll»
+   struct list_head  rdllist;    ──▶  ready list — fd's с pending events
+   struct rb_root_cached rbr;    ──▶  red-black tree всех зарегистрированных fd's
+   struct epitem    *ovflist;    ──▶  overflow list (когда rdllist в processing)
+   struct user_struct *user;     ──▶  rlimit accounting
+   struct file       *file;
+};
+```
+
+- **`rbr`** (red-black tree by file* + fd) — все зарегистрированные через `EPOLL_CTL_ADD` fd. RB-tree даёт O(log N) на
+  `EPOLL_CTL_ADD/MOD/DEL` lookup. Ключ — пара `(struct file*, int fd)`, потому что один fd может быть переоткрыт после
+  close на тот же номер.
+- **`rdllist`** — doubly-linked list `struct epitem`'ов, у которых есть pending event. Это и есть «список готовых fd».
+  `epoll_wait` ходит по этому списку, копирует events в user space, и (для LT) перепроверяет каждый fd на актуальную
+  готовность.
+- **`wq`** — wait queue потоков, ожидающих в `epoll_wait`. При появлении нового события в rdllist делается
+  `wake_up(&ep->wq)`, что будит первого waiter'а (или всех — зависит от EPOLLEXCLUSIVE).
+
+Каждый зарегистрированный fd представлен `struct epitem`:
+
+```
+struct epitem {
+   union {
+     struct rb_node      rbn;       ──▶  узел в eventpoll::rbr
+     struct rcu_head     rcu;
+   };
+   struct list_head      rdllink;   ──▶  узел в eventpoll::rdllist
+   struct epitem        *next;      ──▶  узел в ovflist
+   struct epoll_filefd   ffd;       ──▶  (struct file*, int fd) — ключ
+   struct eventpoll     *ep;        ──▶  back-pointer
+   struct list_head      pwqlist;   ──▶  poll wait queues (callback hooks)
+   struct epoll_event    event;     ──▶  subscribed events + user data
+};
+```
+
+Поле `pwqlist` — самое интересное. При `EPOLL_CTL_ADD` epoll вызывает `f_op->poll()` целевого файла, и эта функция
+регистрирует callback `ep_poll_callback` на native wait queue этого файла (например, у TCP-сокета это
+`sk->sk_wq->wait`). `epitem` хранит список этих регистраций, чтобы при `EPOLL_CTL_DEL` их можно было аккуратно снять.
+
+Диаграмма связей:
+
+```
+                  struct eventpoll
+                  ┌────────────────────────────┐
+                  │  rbr ─────────┐            │
+                  │  rdllist ──┐  │            │
+                  │  wq        │  │            │
+                  └────────────┼──┼────────────┘
+                               │  │
+                               │  └──▶ red-black tree (interest list)
+                               │              │
+                               │       ┌──────┴──────┐
+                               │       ▼             ▼
+                               │   ┌────────┐   ┌────────┐
+                               │   │ epitem │   │ epitem │
+                               │   │ fd=42  │   │ fd=88  │
+                               │   └────────┘   └────────┘
+                               │        │            │
+                               ▼        ▼            ▼
+                          ready list (linked)
+                          ┌──────────────────────────┐
+                          │  head ─▶ epitem(fd=17)   │
+                          │         ─▶ epitem(fd=88) │
+                          │         ─▶ NULL          │
+                          └──────────────────────────┘
+
+  epitem'ы в RB-tree — все, подписанные через EPOLL_CTL_ADD.
+  В ready list — только те, у кого есть pending event.
+  Каждый epitem подписан через pwqlist на native wait queue
+  своего файла (например, sk->sk_wq->wait у TCP-сокета).
+```
+
+### ep_poll_callback flow
+
+Ключ к O(1) cost'у — реактивная модель. epoll не опрашивает fd в момент `epoll_wait`; он подписан на их wake-up'ы.
+
+Когда драйвер устройства (например, TCP stack) получает пакет:
+
+```mermaid
+sequenceDiagram
+    participant NIC
+    participant TCP as TCP stack
+    participant Sock as socket wait queue
+    participant Epoll as ep_poll_callback
+    participant Waiter as epoll_wait thread
+    NIC->>TCP: 1. IRQ / soft-IRQ — пакет принят, дёргает napi
+    TCP->>TCP: 2. tcp_v4_rcv() → tcp_data_queue()<br/>данные кладутся в sk->sk_receive_queue
+    TCP->>Sock: 3. sock_def_readable(sk) — есть данные
+    Sock->>Epoll: 4. wake_up_interruptible_poll(&sk->sk_wq->wait, EPOLLIN)<br/>будит ВСЕХ waiters с маской events
+    Note over Epoll: 5. callback, зарегистрированный epoll<br/>при EPOLL_CTL_ADD через f_op->poll()
+    Epoll->>Epoll: извлечь epitem из container_of(wait, ...)
+    Epoll->>Epoll: проверить key ∩ ep->event.events != 0
+    Epoll->>Epoll: spin_lock(&ep->lock)
+    Epoll->>Epoll: если epitem не в rdllist: list_add_tail(&epi->rdllink, &ep->rdllist)
+    Epoll->>Waiter: если есть waiter'ы на ep->wq: wake_up(&ep->wq)
+    Epoll->>Epoll: spin_unlock(&ep->lock)
+    Note over Waiter: 6. поток, ждавший в epoll_wait, просыпается
+    Waiter->>Waiter: копирует events из rdllist в user buffer<br/>(LT: повторно вызывает f_op->poll() для перепроверки)
+```
+
+`epoll_wait` сам не делает `poll()` ни по одному fd кроме случая LT-revalidation: он просто разгребает `rdllist`,
+который заполняется реактивно через `ep_poll_callback`. Cost — O(R), где R — число ready events, а не O(N) по
+размеру interest list.
+
+LT vs ET в этой картине отличаются только в одной точке: после копирования event'а в user space LT повторно вызывает
+`f_op->poll()` и, если fd всё ещё ready, **оставляет** его в rdllist для следующего `epoll_wait`. ET — удаляет
+безусловно: следующее пробуждение возможно только через свежий `ep_poll_callback`.
+
+### EPOLLEXCLUSIVE
+
+Linux 4.5+ (март 2016). Решает классическую **thundering herd** проблему в многопоточных серверах.
+
+Сценарий: N воркер-потоков, каждый из которых имеет свой epoll fd и регистрирует один и тот же listening socket. Каждый
+делает `epoll_wait`. Приходит входящее соединение → пробуждаются все N потоков → один делает успешный `accept`,
+остальные N-1 получают `EAGAIN` (без `SO_REUSEPORT`) или принимают connection (с `SO_REUSEPORT`, что меняет
+распределение, но не убирает лишние пробуждения).
+
+```mermaid
+flowchart TB
+    subgraph WO["без EPOLLEXCLUSIVE — incoming connection"]
+        ls1["listening sock<br/>accept queue"] -->|wake_up_interruptible_all| w1["worker1<br/>e_wait()"]
+        ls1 --> w2["worker2<br/>e_wait()"]
+        ls1 --> w3["worker3<br/>e_wait()"]
+        ls1 --> w4["worker4<br/>e_wait()"]
+        ls1 --> w5["worker5<br/>e_wait()"]
+        w1 --> r1["accept() OK"]
+        w2 --> r2[EAGAIN]
+        w3 --> r3[EAGAIN]
+        w4 --> r4[EAGAIN]
+        w5 --> r5[EAGAIN]
+    end
+```
+
+wasted wakeup × 4 — лишние context switches, cache thrashing, scheduler queueing.
+
+```mermaid
+flowchart TB
+    subgraph WE["с EPOLLEXCLUSIVE — incoming connection"]
+        ls2[listening sock] -->|wake_up_interruptible only one| ww3["worker3<br/>(выбран kernel'ом)<br/>e_wait()"]
+        ww3 --> ok["accept() OK"]
+    end
+```
+
+Использование: `epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &(struct epoll_event){.events = EPOLLIN | EPOLLEXCLUSIVE})`. На
+уровне ядра флаг изменяет тип wait queue entry с `WQ_FLAG_NONEXCLUSIVE` на exclusive: `wake_up_interruptible` будит
+только одного exclusive waiter'а вместо всех.
+
+Restrictions:
+
+- работает только с `EPOLL_CTL_ADD`, не с `MOD` (поведение нельзя изменить после регистрации);
+- несовместим с `EPOLLONESHOT`;
+- не гарантирует fairness — kernel будит «первого попавшегося», обычно LIFO от wait queue.
+
+nginx использует EPOLLEXCLUSIVE начиная с 1.11.3 для shared listener sockets между worker processes. envoy и HAProxy —
+в worker-per-thread моделях. Для модели с `SO_REUSEPORT` (каждый worker слушает свой socket с тем же портом, kernel
+разруливает hash by 4-tuple) EPOLLEXCLUSIVE не нужен — нет shared waitable объекта.
+
+### EPOLLONESHOT
+
+Флаг для модели «один fd обрабатывается строго одним воркером». После того как `epoll_wait` сообщил event на fd с
+EPOLLONESHOT, fd деактивируется в kernel — больше события на нём не репортятся, пока приложение явно не сделает
+`EPOLL_CTL_MOD` с новой маской events:
+
+```mermaid
+stateDiagram-v2
+    [*] --> armed: EPOLL_CTL_ADD<br/>(events = EPOLLIN | EPOLLONESHOT)
+    armed: armed (reports events)
+    delivered: delivered (silent until MOD)
+    armed --> delivered: data arrives
+    delivered --> armed: EPOLL_CTL_MOD<br/>(events = EPOLLIN | EPOLLONESHOT)
+```
+
+Use case — thread pool с очередью fd's:
+
+- main reactor делает `epoll_wait`, получает ready fd, передаёт его в work queue одного из worker'ов;
+- worker обрабатывает (полностью drain'ит read buffer, отвечает в write buffer);
+- по завершении worker делает `EPOLL_CTL_MOD` чтобы re-arm fd — это сигнал «я закончил, можно снова доставлять events
+  по этому fd».
+
+Без EPOLLONESHOT в multi-worker модели возникала бы race: пока worker A обрабатывает первый event на fd, второй event на
+тот же fd мог бы быть доставлен worker'у B → два потока конкурентно работают с одним соединением, требуется
+дополнительный mutex per-fd. EPOLLONESHOT перекладывает эту дисциплину на ядро.
+
+Отличие от EPOLLEXCLUSIVE:
+
+- EPOLLEXCLUSIVE — про **distribution wakeup**: который из N потоков, ждущих *одного* event'а, будет разбужен.
+- EPOLLONESHOT — про **ownership of fd**: какой поток отвечает за обработку *одного fd* до явного re-arm.
+
+Их можно комбинировать на уровне дизайна (разные epoll fd's per worker + per-fd EPOLLONESHOT для serialized ownership),
+но не на одном epoll_ctl call.
+
 ### События
 
 | Флаг             | Значение                                                              |
@@ -393,6 +590,9 @@ int main(void) {
 сокет имеет собственный outgoing buffer, и `EPOLLOUT` подключается через `EPOLL_CTL_MOD`, когда `write()` вернул
 `EAGAIN`.
 
+!!! example "Рабочий пример"
+    Полная компилируемая реализация edge-triggered epoll echo-сервера с non-blocking сокетами: `examples/q11_epoll_server/server.c` — собрать и запустить: `cd examples && make q11 && ./bin/q11_epoll_server`.
+
 ## Сравнение
 
 ```
@@ -432,7 +632,7 @@ state.
   объекты для epoll
 - [Сигналы](../processes/signals.md) — `signalfd` интегрирует доставку сигналов в epoll loop
 - [IPC](../processes/ipc.md) — `eventfd` как способ разбудить epoll_wait из другого потока
-- [Потоки: основы](../threads/threads_basics.md) — альтернатива thread-per-connection и её ограничения
+- [Потоки: основы](../concurrency/threads_basics.md) — альтернатива thread-per-connection и её ограничения
 
 ## Источники
 

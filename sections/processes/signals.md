@@ -85,11 +85,12 @@
   │  │ ucontext_t uc            │  │  ← сохранённые регистры:
   │  │   uc_mcontext.rip        │  │──────────▶ адрес прерванной инструкции
   │  │   uc_mcontext.rsp        │  │     rsp, rbp, rax, ... всё
+  │  │   uc_mcontext.eflags     │  │  ← rflags/EFLAGS (REG_EFL)
   │  │   uc_sigmask             │  │  ← старая маска сигналов
   │  └──────────────────────────┘  │
   │  siginfo_t info                │  ← si_signo, si_pid, si_addr ...
   │  [адрес возврата: sigreturn() ]│  ← ядро кладёт сюда инструкцию
-  └────────────────────────────────┘    или адрес vDSO-trampoлина
+  └────────────────────────────────┘    или адрес vDSO-trampoline
 
           │  ядро передаёт управление
           ▼
@@ -288,8 +289,9 @@ Standard signal (bitmask)              Realtime signal (FIFO queue)
 │ kill x 5    бит остаётся 1   │       │  │ 34   │ 34   │ 35   │    │ │
 │                              │       │  │ val=A│ val=B│ val=C│    │ │
 │ Доставка: один раз,          │       │  └──────┴──────┴──────┴────┘ │
-│ payload — пусто              │       │ FIFO по приоритету (меньше   │
-│                              │       │ номер = выше приоритет)      │
+│ payload — пусто              │       │ между RT-номерами: меньший   │
+│                              │       │ номер = выше приоритет;      │
+│                              │       │ внутри номера — FIFO arrival │
 └──────────────────────────────┘       └──────────────────────────────┘
 ```
 
@@ -429,26 +431,11 @@ Process-level                Thread-level (у каждого потока — с
 
 ### Наследование маски
 
-```
-                pthread_create()
-                       │
-                       ▼
-  ┌─────────────────────────────────────────────┐
-  │ child thread mask = parent thread mask      │  ← копируется
-  │ pending бит → НЕ наследуется                │  ← новый поток с пустой очередью
-  └─────────────────────────────────────────────┘
-
-  fork():
-  ┌─────────────────────────────────────────────┐
-  │ child process mask = calling thread mask    │
-  │ pending (process + thread) → пустые         │
-  └─────────────────────────────────────────────┘
-
-  execve():
-  ┌─────────────────────────────────────────────┐
-  │ mask сохраняется                            │
-  │ handlers сбрасываются на SIG_DFL/SIG_IGN    │
-  └─────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    PC[pthread_create] --> PCR["child thread mask = parent thread mask (копируется);<br/>pending bits → НЕ наследуется (новый поток, пустая очередь)"]
+    FK[fork] --> FKR["child process mask = calling thread mask;<br/>pending (process + thread) → пустые"]
+    EX[execve] --> EXR["mask сохраняется;<br/>handlers сбрасываются на SIG_DFL / SIG_IGN"]
 ```
 
 Типичный паттерн в многопоточном сервере: главный поток в начале блокирует нужные сигналы через `pthread_sigmask`, затем

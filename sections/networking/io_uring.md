@@ -117,57 +117,20 @@ CQE (16 bytes)
 
 ## Жизненный цикл операции
 
-```
- user space                                                kernel space
-─────────────────                                       ───────────────────
-
-  1. sqe = io_uring_get_sqe(ring)
-        │
-        │ берёт свободный slot в SQ
-        ▼
-  2. io_uring_prep_read(sqe, fd, buf, len, off)
-        │
-        │ заполняет поля: opcode=READ, fd, addr=buf, len, off
-        │ выставляет sqe->user_data = (u64)my_context
-        ▼
-  3. атомарно: sq.tail++
-        │
-        │ store-release, kernel увидит новый tail
-        ▼
-  4. io_uring_submit(ring)  ──────────────▶  io_uring_enter(IORING_ENTER_SUBMIT)
-        │                                         │
-        │ один syscall на ЛЮБОЕ кол-во SQE        │ (в SQPOLL режиме syscall не нужен)
-        │                                         ▼
-        │                                    5. kernel читает SQE начиная с sq.head
-        │                                         │
-        │                                         │ для каждого SQE — запускает
-        │                                         │ операцию: либо синхронно если
-        │                                         │ возможно (page cache hit),
-        │                                         │ либо в io-wq worker thread
-        │                                         ▼
-        │                                    6. операция завершилась
-        │                                         │
-        │                                         │ kernel пишет CQE:
-        │                                         │   cqe->res = result
-        │                                         │   cqe->user_data = sqe->user_data
-        │                                         │
-        │                                         │ атомарно: cq.tail++ (store-release)
-        │                                         │ если приложение ждёт — wakeup
-        ▼                                         │
-  7. io_uring_wait_cqe(ring, &cqe)  ◀───────────  │
-        │
-        │ если cq.head != cq.tail — возврат сразу
-        │ иначе блокируемся через io_uring_enter(GETEVENTS)
-        ▼
-  8. ctx = (my_context*)cqe->user_data
-     обработка ctx с учётом cqe->res
-        │
-        ▼
-  9. io_uring_cqe_seen(ring, cqe)
-        │
-        │ атомарно: cq.head++
-        ▼
-     слот свободен, kernel может писать туда следующий CQE
+```mermaid
+sequenceDiagram
+    participant User as user space
+    participant Kernel as kernel space
+    User->>User: 1. sqe = io_uring_get_sqe(ring)<br/>берёт свободный slot в SQ
+    User->>User: 2. io_uring_prep_read(sqe, fd, buf, len, off)<br/>заполняет opcode=READ, fd, addr=buf, len, off<br/>sqe->user_data = (u64)my_context
+    User->>User: 3. атомарно sq.tail++ (store-release)
+    User->>Kernel: 4. io_uring_submit(ring) → io_uring_enter(IORING_ENTER_SUBMIT)<br/>один syscall на ЛЮБОЕ кол-во SQE<br/>(в SQPOLL режиме syscall не нужен)
+    Kernel->>Kernel: 5. kernel читает SQE начиная с sq.head<br/>для каждого SQE запускает операцию:<br/>синхронно (page cache hit) или в io-wq worker thread
+    Kernel->>Kernel: 6. операция завершилась<br/>kernel пишет CQE: cqe->res, cqe->user_data<br/>атомарно cq.tail++ (store-release)
+    Kernel-->>User: если приложение ждёт — wakeup
+    User->>User: 7. io_uring_wait_cqe(ring, &cqe)<br/>если cq.head != cq.tail — возврат сразу<br/>иначе блокируемся через io_uring_enter(GETEVENTS)
+    User->>User: 8. ctx = (my_context*)cqe->user_data<br/>обработка с учётом cqe->res
+    User->>User: 9. io_uring_cqe_seen(ring, cqe)<br/>атомарно cq.head++<br/>слот свободен для следующего CQE
 ```
 
 Главное: операции **не блокируют** ни submit, ни wait. Можно подготовить 1000 SQE, сделать один `io_uring_submit`, и
@@ -351,6 +314,9 @@ int main(void) {
 Один поток обслуживает все соединения через одно кольцо. Никакого `epoll_wait` + `read` + `write` — всё уходит в kernel
 батчем через `io_uring_submit_and_wait`.
 
+!!! example "Рабочий пример"
+    Полная компилируемая реализация io_uring echo-сервера на liburing (accept → recv → send цепочка через `user_data`): `examples/q12_io_uring_server/server.c` — собрать и запустить (нужен `liburing`): `cd examples && make q12 && ./bin/q12_io_uring_server`.
+
 ## Опкоды
 
 io_uring покрывает практически весь POSIX I/O плюс многое сверху. На 2024 год опкодов больше 60, основные:
@@ -387,15 +353,24 @@ io_uring покрывает практически весь POSIX I/O плюс �
 При флаге `IORING_SETUP_SQPOLL` kernel запускает отдельный thread, который **сам** опрашивает SQ. User space просто
 пишет SQE и инкрементирует `tail` — kernel это увидит без всякого syscall'а.
 
+```mermaid
+sequenceDiagram
+    participant U1 as user (обычный)
+    participant K1 as kernel (обычный)
+    U1->>U1: write SQE
+    U1->>U1: sq.tail++
+    U1->>K1: io_uring_enter() — syscall
+    K1->>K1: kernel выполняет
 ```
-обычный режим:                  SQPOLL режим:
-                                 (kernel thread всегда крутится)
-user: write SQE                  user: write SQE
-user: sq.tail++                  user: sq.tail++
-user: io_uring_enter() ─ syscall    │
-                  │              kernel thread замечает изменение
-                  ▼              kernel thread выполняет операцию
-            kernel выполняет
+
+```mermaid
+sequenceDiagram
+    participant U2 as user (SQPOLL)
+    participant K2 as kernel thread (всегда крутится)
+    U2->>U2: write SQE
+    U2->>U2: sq.tail++
+    K2->>K2: замечает изменение
+    K2->>K2: выполняет операцию
 ```
 
 Нулевая стоимость submit'а — критично для систем с миллионами операций в секунду (high-frequency trading, NVMe
@@ -439,34 +414,38 @@ SQE[1]: WRITE buf    → file_b   (стартует после успешног�
 Опкоды вроде `IORING_OP_RECV_MULTISHOT` и `IORING_OP_ACCEPT_MULTISHOT` производят **много** CQE из одного SQE. Один раз
 запустили accept — каждое новое соединение генерирует CQE, без необходимости заново готовить SQE на каждое.
 
-```
-SQE: ACCEPT_MULTISHOT (один раз)
-                    │
-                    ▼
-        ┌───────────┴───────────┐
-        ▼           ▼           ▼
-      CQE         CQE         CQE      ...
-   (conn #1)   (conn #2)   (conn #3)
+```mermaid
+flowchart TB
+    sqe["SQE: ACCEPT_MULTISHOT (один раз)"] --> cqe1["CQE (conn #1)"]
+    sqe --> cqe2["CQE (conn #2)"]
+    sqe --> cqe3["CQE (conn #3)"]
+    sqe --> dots["..."]
 ```
 
 Особенно полезно для accept-loop серверов: больше нет race между обработкой соединения и подготовкой нового accept.
 
 ## io_uring vs epoll
 
+```mermaid
+sequenceDiagram
+    participant App
+    participant Kernel
+    Note over App,Kernel: epoll: обработка одного TCP-соединения
+    App->>Kernel: epoll_wait() — syscall #1
+    Kernel-->>App: кольцо fd, готовых
+    App->>Kernel: read(fd, buf, n) — syscall #2 (user-kernel copy)
+    App->>Kernel: write(fd, resp, m) — syscall #3 (user-kernel copy)
+    Note over App,Kernel: итого: 3 syscall на 1 event
 ```
-epoll: обработка одного TCP-соединения
-                                              ┌─ syscall #1
-   epoll_wait()  ──▶  кольцо fd, готовых...   │
-   read(fd, buf, n)   ──▶  user-kernel copy   ┝─ syscall #2
-   write(fd, resp, m) ──▶  user-kernel copy   ┝─ syscall #3
-                                              └─ итого: 3 syscall на 1 event
 
-io_uring: то же самое
-                                              ┌─ опционально 0–1 syscall
-   io_uring_submit_and_wait(ring, 1)          │  (в SQPOLL — 0 syscall)
-       │                                      └─
-       │ kernel сам выполняет read и write,
-       │ user читает CQE из shared memory без syscall
+```mermaid
+sequenceDiagram
+    participant App
+    participant Kernel
+    Note over App,Kernel: io_uring: то же самое
+    App->>Kernel: io_uring_submit_and_wait(ring, 1)<br/>опционально 0–1 syscall (в SQPOLL — 0)
+    Kernel->>Kernel: сам выполняет read и write
+    Kernel-->>App: user читает CQE из shared memory без syscall
 ```
 
 | Свойство               | epoll                           | io_uring                                         |

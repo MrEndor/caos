@@ -12,3 +12,5 @@
 | [TCP и UDP: протоколы и тонкости](tcp_udp.md) | Three-way handshake, state machine, TIME_WAIT, flow/congestion control, Nagle, MSS, SO_REUSEPORT |
 | [I/O multiplexing (select, poll, epoll)](io_multiplexing.md) | `fd_set`, `pollfd`, edge-triggered vs level-triggered, C10K, внутреннее устройство epoll |
 | [io_uring](io_uring.md) | Submission/completion queues, SQE/CQE, SQPOLL, fixed buffers, linked SQEs, liburing |
+| [Сетевой стек Linux изнутри](network_stack_internals.md) | Путь пакета RX/TX, `sk_buff`, NAPI, qdisc, RSS/RPS/RFS, GRO/GSO, netfilter hooks, XDP/TC eBPF, диагностика |
+| [netfilter, iptables, nftables, conntrack](netfilter_iptables.md) | 5 hooks, таблицы и chains, NAT (SNAT/DNAT/MASQUERADE), nftables VM, conntrack state machine, Docker/k8s интеграция |

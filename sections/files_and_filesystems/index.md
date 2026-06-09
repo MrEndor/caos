@@ -22,3 +22,10 @@
 | [Права доступа и атрибуты файлов](file_permissions_and_attributes.md) | `chmod`, `chown`, SUID/SGID/sticky, атрибуты ext4            |
 | [Открытые файлы и процессы](open_files_and_processes.md)              | `/proc/<pid>/fd`, `lsof`, `fuser`, таблица открытых файлов   |
 | [Блочные и символьные устройства](block_and_character_devices.md)     | major/minor номера, `/dev`, виртуальные устройства, `mknod`  |
+| [OverlayFS и слои Docker](overlayfs.md)                               | union mount, lower/upper/work, copy-up, whiteouts, overlay2  |
+| [Linux block layer](block_layer.md)                                   | bio, request queue, I/O schedulers, blk-mq, FUA, plugging    |
+| [Внутреннее устройство ФС](filesystem_internals.md)                   | ext4 layout, extents, htree, журналирование, btrfs/XFS/ZFS   |
+| [FUSE: filesystem в userspace](fuse.md)                               | libfuse high/low-level API, FUSE protocol, sshfs/gocryptfs/s3fs внутри, performance |
+| [inotify и fanotify](inotify_fanotify.md)                             | watch descriptors, event masks, fanotify permission events, лимиты IDE/VSCode |
+| [NVMe и SPDK](nvme_spdk.md)                                           | NVMe protocol (SQ/CQ, namespaces, ZNS), NVMe-oF, SPDK polled-mode driver, io_uring IOPOLL |
+| [ZFS и Btrfs](zfs_btrfs.md)                                           | CoW filesystems, ZFS (vdev/zpool/ARC/ZIL/RAID-Z/send-receive), Btrfs (subvolumes/snapshots/reflinks) |
