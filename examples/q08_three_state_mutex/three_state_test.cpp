@@ -32,13 +32,19 @@
 static std::atomic<long long> g_wake_calls_2state{0};
 static std::atomic<long long> g_wake_calls_3state{0};
 
-static int futex_wait(std::atomic<uint32_t>* addr, uint32_t expected) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+// Обёртки шаблонны по enum-типу состояния: у обоих мьютексов своё enum class State
+// с underlying type std::uint32_t (размер futex-слова). Ядро читает 4 байта по
+// адресу atomic'а; expected конвертируем в u32.
+template <class State>
+static int futex_wait(std::atomic<State>* addr, State expected) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                                    expected, nullptr, nullptr, 0));
+                                    static_cast<std::uint32_t>(expected),
+                                    nullptr, nullptr, 0));
 }
-static int futex_wake(std::atomic<uint32_t>* addr, int wake_count) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+template <class State>
+static int futex_wake(std::atomic<State>* addr, int wake_count) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                                     wake_count, nullptr, nullptr, 0));
 }
@@ -48,23 +54,29 @@ static int futex_wake(std::atomic<uint32_t>* addr, int wake_count) {
 // ─────────────────────────────────────────────────────────────────────────────
 class TwoStateMutex {
 public:
+    enum class State : std::uint32_t {
+        Unlocked = 0,
+        Locked   = 1,
+    };
+
     void lock() {
         for (;;) {
-            uint32_t expected = 0;
-            if (state_.compare_exchange_strong(expected, 1,
+            State expected = State::Unlocked;
+            if (state_.compare_exchange_strong(expected, State::Locked,
                                                std::memory_order_acquire,
-                                               std::memory_order_relaxed))
+                                               std::memory_order_relaxed)) {
                 return;
-            futex_wait(&state_, 1);
+            }
+            futex_wait(&state_, State::Locked);
         }
     }
     void unlock() {
-        state_.store(0, std::memory_order_release);
+        state_.store(State::Unlocked, std::memory_order_release);
         g_wake_calls_2state.fetch_add(1, std::memory_order_relaxed);
         futex_wake(&state_, 1); // безусловный wake — лишний syscall, если ждущих нет
     }
 private:
-    std::atomic<uint32_t> state_{0};
+    std::atomic<State> state_{State::Unlocked};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,35 +88,43 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 class ThreeStateMutex {
 public:
-    void lock() {
-        // Fast path: 0 -> 1 (заняли, ждущих нет).
-        uint32_t expected = 0;
-        if (state_.compare_exchange_strong(expected, 1,
-                                           std::memory_order_acquire,
-                                           std::memory_order_relaxed))
-            return;
+    enum class State : std::uint32_t {
+        Unlocked      = 0,   // свободен
+        Locked        = 1,   // занят, ждущих нет
+        LockedWaiters = 2,   // занят, есть ждущие
+    };
 
-        // Contended path: помечаем мьютекс как "занят со ждущими" (xchg на 2)
-        // и спим, пока обмен не вернёт 0 (то есть мьютекс стал свободен).
-        while (state_.exchange(2, std::memory_order_acquire) != 0) {
-            futex_wait(&state_, 2); // ждём, пока значение остаётся 2
+    void lock() {
+        // Fast path: Unlocked -> Locked (заняли, ждущих нет).
+        State expected = State::Unlocked;
+        if (state_.compare_exchange_strong(expected, State::Locked,
+                                           std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+            return;
+        }
+
+        // Contended path: помечаем мьютекс как LockedWaiters (xchg) и спим, пока
+        // обмен не вернёт Unlocked (то есть мьютекс стал свободен).
+        while (state_.exchange(State::LockedWaiters,
+                               std::memory_order_acquire) != State::Unlocked) {
+            futex_wait(&state_, State::LockedWaiters); // ждём, пока значение LockedWaiters
         }
     }
 
     void unlock() {
-        // Если состояние было 1 (ждущих не было) — обнуляем без futex_wake.
-        // fetch_sub(1): 1 -> 0. Если результат был не 1, значит было 2.
-        if (state_.fetch_sub(1, std::memory_order_release) != 1) {
-            // Были ждущие: переводим в 0 и будим одного.
-            state_.store(0, std::memory_order_release);
+        // exchange на Unlocked возвращает прежнее состояние. Если оно было
+        // LockedWaiters — были ждущие, нужен futex_wake. Если Locked — ждущих не
+        // было, обходимся без единого системного вызова. На enum нельзя fetch_sub,
+        // поэтому используем exchange (он же убирает второй store из старой версии).
+        if (state_.exchange(State::Unlocked,
+                            std::memory_order_release) == State::LockedWaiters) {
             g_wake_calls_3state.fetch_add(1, std::memory_order_relaxed);
             futex_wake(&state_, 1);
         }
-        // иначе: state уже 0, никаких системных вызовов
     }
 
 private:
-    std::atomic<uint32_t> state_{0};
+    std::atomic<State> state_{State::Unlocked};
 };
 
 // Прогоняет короткую критическую секцию (низкая конкуренция -> часто срабатывает

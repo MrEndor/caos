@@ -67,5 +67,34 @@ fiber_switch:
     ret
     .size fiber_switch, .-fiber_switch
 
+/* void* setup_context(void* stack_top, void (*entry)())
+ *   rdi = stack_top  — верх стека новой фибры (high addr)
+ *   rsi = entry      — точка входа; сюда уйдёт ret первого fiber_switch
+ *   rax = sp         — значение для fiber_switch как restore_sp
+ *
+ * Раскладываем на дне стека «фейковый кадр» под формат, который ждёт восстановление
+ * в fiber_switch: шесть слотов callee-saved (fiber_switch снимет их в регистры —
+ * значения для новой фибры не важны), над ними адрес возврата = entry, и ещё один
+ * слот сверху для выравнивания.
+ *
+ *   rax+0  = r15 slot   ┐
+ *   rax+8  = r14 slot   │ callee-saved: не инициализируем — fiber_switch загрузит их
+ *   rax+16 = r13 slot   │ в регистры, но новая фибра ими не пользуется до первого
+ *   rax+24 = r12 slot   │ настоящего переключения, так что любое значение годится
+ *   rax+32 = rbx slot   │
+ *   rax+40 = rbp slot   ┘
+ *   rax+48 = entry      — адрес возврата: ret в fiber_switch прыгнет сюда
+ *   rax+56 = align slot — после ret rsp окажется здесь (top-8), rsp%16==8 как требует
+ *                         SysV ABI на входе в функцию; сам слот не читается
+ */
+    .globl setup_context
+    .type  setup_context, @function
+setup_context:
+    andq $-16, %rdi          /* выровнять вершину стека по 16 байт */
+    leaq -64(%rdi), %rax     /* зарезервировать 8 слотов: 6 callee-saved + entry + align */
+    movq %rsi, 48(%rax)      /* положить адрес возврата = entry */
+    ret
+    .size setup_context, .-setup_context
+
 /* Помечаем стек как неисполняемый (без этого линкер ругается на .S). */
     .section .note.GNU-stack,"",@progbits

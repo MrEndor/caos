@@ -37,13 +37,20 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static int futex_wait(std::atomic<uint32_t>* addr, uint32_t expected) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+// Обёртки шаблонны по типу слова: FutexMutex ждёт на enum class State, а
+// FutexCondvar — на счётчике поколений seq (uint32_t). Оба типа 4-байтовые;
+// expected конвертируем в u32 (для enum это static_cast underlying type, для
+// uint32_t — тождество).
+template <class Word>
+static int futex_wait(std::atomic<Word>* addr, Word expected) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                                    expected, nullptr, nullptr, 0));
+                                    static_cast<std::uint32_t>(expected),
+                                    nullptr, nullptr, 0));
 }
-static int futex_wake(std::atomic<uint32_t>* addr, int wake_count) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+template <class Word>
+static int futex_wake(std::atomic<Word>* addr, int wake_count) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                                     wake_count, nullptr, nullptr, 0));
 }
@@ -53,22 +60,28 @@ static int futex_wake(std::atomic<uint32_t>* addr, int wake_count) {
 // ─────────────────────────────────────────────────────────────────────────────
 class FutexMutex {
 public:
+    enum class State : std::uint32_t {
+        Unlocked = 0,
+        Locked   = 1,
+    };
+
     void lock() {
         for (;;) {
-            uint32_t expected = 0;
-            if (state_.compare_exchange_strong(expected, 1,
+            State expected = State::Unlocked;
+            if (state_.compare_exchange_strong(expected, State::Locked,
                                                std::memory_order_acquire,
-                                               std::memory_order_relaxed))
+                                               std::memory_order_relaxed)) {
                 return;
-            futex_wait(&state_, 1);
+            }
+            futex_wait(&state_, State::Locked);
         }
     }
     void unlock() {
-        state_.store(0, std::memory_order_release);
+        state_.store(State::Unlocked, std::memory_order_release);
         futex_wake(&state_, 1);
     }
 private:
-    std::atomic<uint32_t> state_{0};
+    std::atomic<State> state_{State::Unlocked};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

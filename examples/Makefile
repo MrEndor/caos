@@ -25,7 +25,8 @@ $(shell mkdir -p $(BIN))
 
 # ── иллюстративные demo (запускаются, печатают вывод) ──
 DEMO_TARGETS := \
-  q01_server q02_server q02_client q10_server q11_server q12_server \
+  q01_server q02_server q02_client q10_server \
+  q11_select q11_poll q11_epoll q12_server \
   q13_demo q15_ucontext q15_asm
 
 # ── GoogleTest (проверка корректности) ──
@@ -48,7 +49,9 @@ q01_server: ; $(CXX) $(CXXFLAGS) q01_sync_tcp_server/server.cpp      -o $(BIN)/$
 q02_server: ; $(CXX) $(CXXFLAGS) q02_threaded_tcp/server.cpp         -o $(BIN)/$@ $(PTHREAD)
 q02_client: ; $(CXX) $(CXXFLAGS) q02_threaded_tcp/client.cpp         -o $(BIN)/$@
 q10_server: ; $(CXX) $(CXXFLAGS) q10_nonblocking_busyloop/server.cpp -o $(BIN)/$@
-q11_server: ; $(CXX) $(CXXFLAGS) q11_epoll_server/server.cpp         -o $(BIN)/$@
+q11_select: ; $(CXX) $(CXXFLAGS) q11_epoll_server/select_server.cpp  -o $(BIN)/$@
+q11_poll:   ; $(CXX) $(CXXFLAGS) q11_epoll_server/poll_server.cpp    -o $(BIN)/$@
+q11_epoll:  ; $(CXX) $(CXXFLAGS) q11_epoll_server/server.cpp         -o $(BIN)/$@
 q12_server: ; $(CXX) $(CXXFLAGS) q12_io_uring_server/server.cpp      -o $(BIN)/$@ -luring
 
 # ── demo: async / фибры ──
@@ -93,7 +96,7 @@ q07: q07_test
 q08: q08_test
 q09: q09_test
 q10: q10_server
-q11: q11_server
+q11: q11_select q11_poll q11_epoll
 q12: q12_server
 q13: q13_demo
 q14: q14_test

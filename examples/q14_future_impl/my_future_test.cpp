@@ -45,7 +45,7 @@ struct SharedState {
 
     void set_value(T value) {
         {
-            std::lock_guard<std::mutex> lock(mtx);
+            std::lock_guard lock(mtx);
             if (ready) {
                 throw std::logic_error("promise already satisfied");
             }
@@ -57,7 +57,7 @@ struct SharedState {
 
     void set_exception(std::exception_ptr eptr) {
         {
-            std::lock_guard<std::mutex> lock(mtx);
+            std::lock_guard lock(mtx);
             if (ready) {
                 throw std::logic_error("promise already satisfied");
             }
@@ -68,13 +68,13 @@ struct SharedState {
     }
 
     void wait() {
-        std::unique_lock<std::mutex> lock(mtx);
+        std::unique_lock lock(mtx);
         // Ждём на cv, пока пишущая сторона не выставит ready (защита от ложных пробуждений).
         cv.wait(lock, [this] { return ready; });
     }
 
     T get() {
-        std::unique_lock<std::mutex> lock(mtx);
+        std::unique_lock lock(mtx);
         cv.wait(lock, [this] { return ready; });
         if (slot.index() == 2) {
             // Внутри была ошибка — пробрасываем её в поток-читатель.

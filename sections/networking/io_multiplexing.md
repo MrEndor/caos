@@ -591,7 +591,7 @@ int main(void) {
 `EAGAIN`.
 
 !!! example "Рабочий пример"
-    Полная компилируемая реализация edge-triggered epoll echo-сервера с non-blocking сокетами: `examples/q11_epoll_server/server.c` — собрать и запустить: `cd examples && make q11 && ./bin/q11_epoll_server`.
+    Три echo-сервера, реализующие одно и то же на разных API — для прямого сравнения: `examples/q11_epoll_server/select_server.cpp` (select), `poll_server.cpp` (poll), `server.cpp` (epoll, edge-triggered). Собрать: `cd examples && make q11` → бинарники `./bin/q11_select`, `./bin/q11_poll`, `./bin/q11_epoll` (порт 8080; проверка — `make q02_client && ./bin/q02_client "hello"`).
 
 ## Сравнение
 

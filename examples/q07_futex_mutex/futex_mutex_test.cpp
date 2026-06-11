@@ -24,60 +24,69 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// Состояния двухсостояночного мьютекса (futex word — это u32, поэтому
+// underlying type у enum — std::uint32_t).
+enum class State : std::uint32_t {
+    Unlocked = 0,   // свободен
+    Locked   = 1,   // занят
+};
+
 // futex_wait: усыпить поток, ПОКА *addr == expected. Если значение уже изменилось,
 // возвращается немедленно (это защищает от потери пробуждения). PRIVATE_FLAG —
 // futex используется только внутри процесса (быстрее, без учёта shared-памяти).
-static int futex_wait(std::atomic<uint32_t>* addr, uint32_t expected) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+// Ядро читает 4 байта по адресу atomic'а; expected конвертируем в u32.
+static int futex_wait(std::atomic<State>* addr, State expected) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                                    expected, nullptr, nullptr, 0));
+                                    static_cast<std::uint32_t>(expected),
+                                    nullptr, nullptr, 0));
 }
 
 // futex_wake: разбудить до wake_count потоков, ждущих на этом адресе.
-static int futex_wake(std::atomic<uint32_t>* addr, int wake_count) {
-    return static_cast<int>(syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr),
+static int futex_wake(std::atomic<State>* addr, int wake_count) {
+    return static_cast<int>(syscall(SYS_futex, addr,
                                     FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                                     wake_count, nullptr, nullptr, 0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Мьютекс на двух состояниях.
-//   0 — свободен, 1 — занят.
+// Мьютекс на двух состояниях: Unlocked / Locked.
 // Минус двухсостояночной схемы: unlock ВСЕГДА делает futex_wake, даже если
 // ждущих нет (лишний syscall). Эту проблему решает трёхсостояночный вариант (q08).
 // ─────────────────────────────────────────────────────────────────────────────
 class FutexMutex {
 public:
     void lock() {
-        // Fast path + короткий спин: пробуем перевести 0 -> 1 без ухода в ядро.
+        // Fast path + короткий спин: пробуем Unlocked -> Locked без ухода в ядро.
         for (int spin = 0; spin < 40; ++spin) {
-            uint32_t expected = 0;
-            if (state_.compare_exchange_strong(expected, 1,
+            State expected = State::Unlocked;
+            if (state_.compare_exchange_strong(expected, State::Locked,
                                                std::memory_order_acquire,
-                                               std::memory_order_relaxed))
+                                               std::memory_order_relaxed)) {
                 return;
+            }
             std::this_thread::yield();
         }
-        // Slow path: спин не помог — засыпаем в ядре, пока state != 1.
+        // Slow path: спин не помог — засыпаем в ядре, пока state остаётся Locked.
         for (;;) {
-            uint32_t expected = 0;
-            if (state_.compare_exchange_strong(expected, 1,
+            State expected = State::Unlocked;
+            if (state_.compare_exchange_strong(expected, State::Locked,
                                                std::memory_order_acquire,
-                                               std::memory_order_relaxed))
+                                               std::memory_order_relaxed)) {
                 return;
-            // Ждём, пока кто-то не сделает unlock (state станет 0).
-            futex_wait(&state_, 1);
+            }
+            futex_wait(&state_, State::Locked);  // спим, пока *state == Locked
         }
     }
 
     void unlock() {
-        state_.store(0, std::memory_order_release);
+        state_.store(State::Unlocked, std::memory_order_release);
         // Будим одного ожидающего. В 2-state делаем это всегда (даже без ждущих).
         futex_wake(&state_, 1);
     }
 
 private:
-    std::atomic<uint32_t> state_{0};
+    std::atomic<State> state_{State::Unlocked};
 };
 
 // N потоков инкрементят общий счётчик под FutexMutex. Если взаимное исключение

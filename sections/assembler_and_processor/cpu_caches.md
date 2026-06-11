@@ -198,7 +198,7 @@ power-of-two strides (типичная антипатеррн в наивном 
 | **Write-back**    | Запись только в кэш + установка dirty bit; на eviction пишет в нижний уровень | Меньше bandwidth; сложнее coherency (см. MESI) |
 
 Современные CPU используют **write-back** для L1/L2/L3 — экономит bandwidth между уровнями. Write-through иногда
-применяется для L1d→L2 если L2 inclusive (Intel до Skylake), чтобы не тащить dirty проверку.
+применяется для L1d->L2 если L2 inclusive (Intel до Skylake), чтобы не тащить dirty проверку.
 
 При **write miss** (запись по адресу, которого нет в кэше):
 
@@ -235,7 +235,7 @@ Cache lookup начинается с **index'а** — но какой адрес
 | **VIVT** (Virtually-Indexed, Virtually-Tagged)   | виртуальный | виртуальный | Самый быстрый, но homonym/synonym проблемы            |
 
 Современные x86-64 L1d используют **VIPT с ограничением**: размер way ≤ page size (4 KB). Это гарантирует, что биты
-index лежат в page offset, который одинаков для виртуального и физического адреса → aliasing невозможен. Именно поэтому
+index лежат в page offset, который одинаков для виртуального и физического адреса -> aliasing невозможен. Именно поэтому
 L1d Intel = 48 KB / 12-way = 4 KB на way — ровно page size. L2 и L3 — PIPT (TLB уже разрешён к моменту попадания на L2).
 
 ### MSHR и non-blocking caches
@@ -433,14 +433,19 @@ stateDiagram-v2
 
 Та же таблица переходов в явном виде (строка — текущее состояние, столбец — событие):
 
-| Из \ событие | PrRd                                      | PrWr             | BusRd (snoop)      | BusRdX (snoop)     | BusUpgr (snoop) |
-|--------------|-------------------------------------------|------------------|--------------------|--------------------|-----------------|
-| **I**        | → `E` если ¬S(other), иначе → `S` (BusRd) | → `M` (BusRdX)   | → `I`              | → `I`              | → `I`           |
-| **E**        | → `E` (hit)                               | → `M` (без шины) | → `S`              | → `I`              | —¹              |
-| **S**        | → `S` (hit)                               | → `M` (BusUpgr)  | → `S`              | → `I`              | → `I`           |
-| **M**        | → `M` (hit)                               | → `M` (hit)      | → `S` (write-back) | → `I` (write-back) | —¹              |
+| Из \ событие | PrRd                                         | PrWr                 | BusRd (snoop)    | BusRdX (snoop)   | BusUpgr (snoop) |
+|--------------|----------------------------------------------|----------------------|------------------|------------------|-----------------|
+| **I**        | `E` если ¬S(other), иначе `S` (испуск BusRd) | `M` (испуск BusRdX)  | `I` (ничего)     | `I` (ничего)     | `I` (ничего)    |
+| **E**        | `E` (hit)                                    | `M` (без шины)       | `S`              | `I`              | —¹              |
+| **S**        | `S` (hit)                                    | `M` (испуск BusUpgr) | `S`              | `I`              | `I`             |
+| **M**        | `M` (hit)                                    | `M` (hit)            | `S` (write-back) | `I` (write-back) | —¹              |
 
 ¹ `BusUpgr` исходит только от ядра, держащего линию в `S`; пока кто-то в `E`/`M`, у других нет `S`-копии, поэтому эта пара состояние/событие не возникает.
+
+!!! note "Испускаем vs наблюдаем — почему одна транзакция в двух колонках"
+    Колонки делятся на два класса. **PrRd, PrWr** — операции *своего* ядра; транзакция в скобках (`испуск BusRdX`) — это то, что наше ядро **само выкладывает на шину** как следствие. **BusRd / BusRdX / BusUpgr** — это snoop-события: транзакции, которые выложил **кто-то другой**, а мы их наблюдаем и реагируем.
+
+    Отсюда кажущееся противоречие: `I` + `PrWr` даёт `M` (наше ядро *испускает* BusRdX, чтобы забрать линию в собственность), а `I` + `BusRdX` (snoop) оставляет `I` — потому что это **чужой** BusRdX, а у нас в `Invalid` нет ни копии для инвалидации, ни грязных данных для write-back, делать нечего. Один и тот же провод BusRdX: у инициатора это PrWr-переход `I` в `M`, у наблюдателя — snoop-реакция. Ядро никогда не «снупит собственную транзакцию» как меняющее состояние событие.
 
 Ключевые инварианты, которые FSM поддерживает: в `M` или `E` линия ровно в одном кэше (эксклюзивность), `M` означает «RAM устарела» (нужен write-back перед отдачей соседу), а переход в `M` из `S` всегда требует `BusUpgr`/`BusRdX` — погасить чужие копии.
 
@@ -448,12 +453,12 @@ stateDiagram-v2
 
 | Переход                                        | Что происходит                                     | Цена                     |
 |------------------------------------------------|----------------------------------------------------|--------------------------|
-| `I → E` (local read miss, line ни у кого)      | подтянуть из L3/RAM                                | 40–100 ns                |
-| `I → S` (local read miss, линия есть у других) | копия из соседнего L1/L2 (cache-to-cache transfer) | 20–60 ns                 |
-| `E → M` (local write)                          | бесплатно, никому сообщать не надо                 | ~0                       |
-| `S → M` (local write при shared)               | **invalidate** во все остальные L1                 | 30–100 ns на каждом ядре |
-| `M → I` (remote write при modified)            | write-back в RAM, потом invalidate                 | 100+ ns                  |
-| `M → S` (remote read при modified)             | write-back, переход в S у обоих                    | 60–100 ns                |
+| `I -> E` (local read miss, line ни у кого)      | подтянуть из L3/RAM                                | 40–100 ns                |
+| `I -> S` (local read miss, линия есть у других) | копия из соседнего L1/L2 (cache-to-cache transfer) | 20–60 ns                 |
+| `E -> M` (local write)                          | бесплатно, никому сообщать не надо                 | ~0                       |
+| `S -> M` (local write при shared)               | **invalidate** во все остальные L1                 | 30–100 ns на каждом ядре |
+| `M -> I` (remote write при modified)            | write-back в RAM, потом invalidate                 | 100+ ns                  |
+| `M -> S` (remote read при modified)             | write-back, переход в S у обоих                    | 60–100 ns                |
 
 Что происходит в L1 двух ядер при чтении/записи общей переменной:
 
@@ -462,17 +467,17 @@ stateDiagram-v2
        ┌─ Core 0 L1 ─┐    ┌─ Core 1 L1 ─┐
        │  X = 5  [E] │    │   (нет X)   │
        └─────────────┘    └─────────────┘
-       Snoop: никто не ответил → state = Exclusive
+       Snoop: никто не ответил -> state = Exclusive
 
 Шаг 2: Core 1 читает тот же X
        ┌─ Core 0 L1 ─┐    ┌─ Core 1 L1 ─┐
        │  X = 5  [S] │    │  X = 5  [S] │
        └─────────────┘    └─────────────┘
-       Core 0 snoop hit → отдаёт линию, оба переходят в Shared
+       Core 0 snoop hit -> отдаёт линию, оба переходят в Shared
 
 Шаг 3: Core 0 пишет X = 7
        ┌─ Core 0 L1 ─┐    ┌─ Core 1 L1 ─┐
-       │  X = 7  [M] │    │  X = -- [I] │  ← Core 0 послал invalidate
+       │  X = 7  [M] │    │  X = -- [I] │  <- Core 0 послал invalidate
        └─────────────┘    └─────────────┘
        Шина: BusRdX (read-for-ownership), Core 1 откидывает копию
 
@@ -480,7 +485,7 @@ stateDiagram-v2
        ┌─ Core 0 L1 ─┐    ┌─ Core 1 L1 ─┐
        │  X = 7  [S] │    │  X = 7  [S] │
        └─────────────┘    └─────────────┘
-       Core 1 snoop miss → Core 0 видит запрос на грязную линию,
+       Core 1 snoop miss -> Core 0 видит запрос на грязную линию,
        делает write-back в RAM и переходит в Shared
 ```
 
@@ -525,15 +530,15 @@ void *thread1(void *arg) {
 Time   Core 0 (cnt.c0++)             Core 1 (cnt.c1++)              L1[Core 0]  L1[Core 1]
 ────────────────────────────────────────────────────────────────────────────────────────────
 t0     read  cnt.c0   miss                                            [E]         [I]
-t1     write cnt.c0           [E→M]                                   [M]         [I]
-t2                                    read  cnt.c1   miss             [M→S]       [I→S]
-                                      ← Core 0 write-back + share
-t3                                    write cnt.c1           [S→M]    [S→I]       [M]
-                                      ← invalidate Core 0
-t4     read  cnt.c0   miss                                            [I→S]       [M→S]
-       ← Core 1 write-back + share
-t5     write cnt.c0           [S→M]                                   [M]         [S→I]
-       ← invalidate Core 1
+t1     write cnt.c0           [E>M]                                   [M]         [I]
+t2                                    read  cnt.c1   miss             [M>S]       [I>S]
+                                      <- Core 0 write-back + share
+t3                                    write cnt.c1           [S>M]    [S>I]       [M]
+                                      <- invalidate Core 0
+t4     read  cnt.c0   miss                                            [I>S]       [M>S]
+       <- Core 1 write-back + share
+t5     write cnt.c0           [S>M]                                   [M]         [S>I]
+       <- invalidate Core 1
 ...    (бесконечный пинг-понг линии между L1 двух ядер)
 ```
 
@@ -543,7 +548,7 @@ t5     write cnt.c0           [S→M]                                   [M]     
 Диагностика через `perf`:
 
 ```bash
-# Считаем misses на L1 и факты переходов M→I/S→I (HITM events)
+# Считаем misses на L1 и факты переходов M->I/S->I (HITM events)
 perf stat -e cache-misses,cache-references,\
 mem_load_l3_hit_retired.xsnp_hitm \
 ./false_sharing_bin
@@ -620,7 +625,7 @@ void sum_list(struct node *head) {
 
 - Prefetch — **подсказка**, не команда. CPU может проигнорировать (например, при перегрузке load buffer'ов или TLB
   miss).
-- Слишком ранний prefetch → линия вытесняется до использования. Слишком поздний → не успевает прийти. Полезно держать
+- Слишком ранний prefetch -> линия вытесняется до использования. Слишком поздний -> не успевает прийти. Полезно держать
   «дистанцию» в ~50–200 циклов перед load.
 - Prefetch на спекулятивный адрес безопасен (page fault не возникает — `prefetch` его подавляет). Но prefetch по
   мусорному указателю забивает TLB.

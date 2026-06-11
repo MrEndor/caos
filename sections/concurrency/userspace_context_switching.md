@@ -1,4 +1,4 @@
-# Переключение контекста в user space: setjmp/longjmp, ucontext, фибры и coroutine'ы
+# Переключение контекста в user space: setjmp/longjmp, ucontext, собственный asm-switch
 
 Kernel context switch (см. [context switch](../processes/context_switch.md)) переключает целую task'у: меняет page
 tables через `CR3`, сохраняет FPU/SSE/AVX state, обновляет TSS, инвалидирует TLB-записи. Стоимость — единицы
@@ -6,8 +6,12 @@ tables через `CR3`, сохраняет FPU/SSE/AVX state, обновляе�
 
 **User space context switching** делает то же самое — меняет «нить исполнения» — но без участия ядра. Сохраняется только
 то, что строго необходимо: регистры, stack pointer, instruction pointer. Ни syscall'ов, ни смены адресного пространства,
-ни инвалидации TLB. На этом фундаменте строятся `setjmp`/`longjmp` (non-local goto для error recovery), POSIX
-`ucontext` (полноценный userspace-контекст), fibers (Boost.Context, libco, libaco) и coroutine'ы.
+ни инвалидации TLB.
+
+Эта статья — про три способа переключить контекст в user space: `setjmp`/`longjmp` (non-local goto для error recovery),
+POSIX `ucontext` (полноценный userspace-контекст) и собственный switch на ассемблере (Boost.Context, libco, libaco). То,
+что строится **поверх** этого примитива, вынесено в отдельные статьи: stackful [фиберы](fibers.md) (scheduler,
+trampoline, work-stealing, M:N) и stackless [C++20 coroutines](coroutines_cpp20.md).
 
 ```
 Стоимость переключения (примерно):
@@ -461,208 +465,7 @@ sequenceDiagram
 всё).
 
 !!! example "Рабочий пример"
-    Полная компилируемая реализация stackful fiber с переключением контекста, guard page и `resume`/`yield`: `examples/q15_fibers/fiber.cpp` — собрать и запустить: `cd examples && make q15 && ./bin/q15_fibers`.
-
-## Scheduler-based fibers
-
-Прямая передача управления (`swap(a, b)`) работает на двух fiber'ах, но не масштабируется: для N fiber'ов каждой нужно
-знать, кому уступить. Нормальное решение — добавить **планировщик**: один контекст-«диспетчер», очередь готовых fiber'ов,
-и единая операция `yield()`, которая возвращает управление диспетчеру. Тот сам выберет следующего.
-
-```cpp
-#include <ucontext.h>
-#include <queue>
-#include <list>
-#include <functional>
-
-constexpr size_t STACK_SIZE = 64 * 1024;
-
-struct Fiber {
-    ucontext_t ctx;
-    std::vector<char> stack;
-    std::function<void()> entry;
-    bool finished = false;
-};
-
-class Scheduler {
-    ucontext_t sched_ctx{};                       // диспетчер
-    std::queue<Fiber*> ready;                     // FIFO готовых
-    Fiber *current = nullptr;
-    std::list<Fiber> fibers;                      // владение
-
-    static void trampoline(unsigned hi, unsigned lo) {
-        auto ptr = (uintptr_t)hi << 32 | lo;
-        auto *f = reinterpret_cast<Fiber*>(ptr);
-        f->entry();
-        f->finished = true;
-        // возврат в диспетчер — uc_link
-    }
-
-public:
-    Fiber* spawn(std::function<void()> fn) {
-        fibers.emplace_back();
-        Fiber &f = fibers.back();
-        f.stack.resize(STACK_SIZE);
-        f.entry = std::move(fn);
-
-        getcontext(&f.ctx);
-        f.ctx.uc_stack.ss_sp   = f.stack.data();
-        f.ctx.uc_stack.ss_size = f.stack.size();
-        f.ctx.uc_link          = &sched_ctx;
-        auto p = reinterpret_cast<uintptr_t>(&f);
-        makecontext(&f.ctx, (void(*)())trampoline, 2,
-                    (unsigned)(p >> 32), (unsigned)p);
-
-        ready.push(&f);
-        return &f;
-    }
-
-    void yield() {
-        ready.push(current);                      // обратно в очередь
-        Fiber *me = current;
-        current = nullptr;
-        swapcontext(&me->ctx, &sched_ctx);        // → диспетчер
-    }
-
-    void run() {
-        while (!ready.empty()) {
-            current = ready.front(); ready.pop();
-            swapcontext(&sched_ctx, &current->ctx);
-            if (current && current->finished) {   // уже вернулся через uc_link
-                // здесь можно почистить fiber, освободить стек
-            }
-            current = nullptr;
-        }
-    }
-};
-
-thread_local Scheduler *g_sched = nullptr;
-inline void fiber_yield() { g_sched->yield(); }
-```
-
-Использование:
-
-```cpp
-int main() {
-    Scheduler s; g_sched = &s;
-
-    s.spawn([] {
-        for (int i = 0; i < 3; i++) { printf("A %d\n", i); fiber_yield(); }
-    });
-    s.spawn([] {
-        for (int i = 0; i < 3; i++) { printf("B %d\n", i); fiber_yield(); }
-    });
-
-    s.run();   // A 0, B 0, A 1, B 1, A 2, B 2
-}
-```
-
-```mermaid
-flowchart TD
-    A[Scheduler::run] --> B{ready.empty?}
-    B -->|no| C[next = ready.pop]
-    C --> D[swap sched → next.ctx]
-    D --> E[fiber runs]
-    E --> F{yield or finished?}
-    F -->|fiber_yield| G[ready.push self]
-    G --> H[swap self → sched]
-    H --> B
-    F -->|finished| B
-    B -->|yes| I[exit run loop]
-```
-
-Это базовая модель M:N-runtime'а: N fiber'ов мультиплексируются на одного диспетчера. Все mainstream-реализации
-расширяют её одинаковыми штрихами:
-
-- **Go goroutines** — preempted (через периодические safe point'ы, вставляемые компилятором), work-stealing scheduler по
-  M:N (P workers, G goroutines, N OS-threads), растущие стеки от 2 KB.
-- **Rust async/await + Tokio** — stackless coroutine'ы, единый event loop с work-stealing, тогда как `tokio::spawn` —
-  аналог `spawn` выше. `await` встаёт ровно на месте `fiber_yield`, но компилятор разворачивает функцию в state machine
-  (см. ниже про stackless).
-- **C++ Boost.Asio strand'ы / asio::awaitable** — то же, но stackless coroutine'ы C++20.
-- **Java Project Loom (virtual threads)** — фактически Java-runtime'овая реализация stackful fiber'ов с собственным
-  scheduler'ом поверх Carrier Thread'ов.
-
-Все они отличаются от показанного scheduler'а в deeper details (приоритеты, fairness, NUMA-aware queues, integration с
-event loop'ом для I/O), но архитектурный костяк — тот же: ready queue + `swap(current, scheduler)`.
-
-## Fault injection в кооперативные runtime'ы
-
-Кооперативный scheduler даёт побочную выгоду, которой нет у preempted threads: **детерминизм**. Каждый прогон с одним и
-тем же seed'ом scheduler'а пойдёт по одной и той же траектории. Это окно для целого класса инструментов — fault
-injection / shuffling scheduler'ов, превращающих тест-сьют concurrency-кода из «иногда падает на CI» в воспроизводимый
-binary search по пространству interleaving'ов.
-
-Идея простая: подменить `yield()` (или его аналог) на «yield в момент, выбранный pseudo-random'ом из seed'а». Если код
-содержит race condition, конкретный seed его обнажит, тест упадёт с понятным трейсом — а главное, при перезапуске с тем
-же seed'ом упадёт ровно так же.
-
-```cpp
-class ShufflingScheduler {
-    std::mt19937 rng;
-    std::vector<Fiber*> ready;             // не queue, а vector — нужен random access
-    Fiber *current = nullptr;
-
-public:
-    ShufflingScheduler(uint64_t seed) : rng(seed) {}
-
-    void yield() {
-        ready.push_back(current);
-        std::uniform_int_distribution<size_t> dist(0, ready.size() - 1);
-        size_t idx = dist(rng);                // выбрать СЛУЧАЙНОГО следующего
-        Fiber *next = ready[idx];
-        ready.erase(ready.begin() + idx);
-        Fiber *me = current;
-        current = next;
-        swapcontext(&me->ctx, &next->ctx);
-    }
-};
-```
-
-Запустить тест с `seed = 0..1000`, если хоть один прогон упал — баг найден, можно перезапускать с тем же seed'ом сколько
-угодно. Это и делают:
-
-- **Loom** (Rust) — model checker для `loom::sync` примитивов. Подменяет atomic'и, mutex'ы, channel'ы, перебирает все
-  possible interleaving'и (не random, а exhaustive — partial order reduction). Запускает тест сотни раз, при провале
-  отдаёт минимальный counterexample.
-- **Shuttle** (Rust, AWS) — randomized version Loom: миллионы random schedule'ов вместо exhaustive поиска. Дешевле, чем
-  Loom, но без гарантии полноты; находит баги быстрее на больших кодовых базах.
-- **Madsim** (Rust) — детерминированный simulator для распределённых систем: подменяет tokio runtime + сеть + время. Один
-  seed = одна траектория всей кластерной симуляции. Используется в TiKV, RisingWave для тестирования consensus.
-- **FoundationDB simulation** (C++) — прародитель идеи. Весь production-код запускается под `Net2` simulator'ом, где
-  сеть, диск, время — fake. Перебирают тысячи seed'ов, при падении воспроизводят один-в-один.
-
-```
-обычный thread-based тест                fiber-based с fault injection
-
-  thread 1     thread 2                    fiber 1     fiber 2     scheduler
-  ────────     ────────                    ────────    ────────    ─────────
-   x = 1                                                            seed = 42
-                                            x = 1                   yield(seed)
-                  y = 2                                              ──▶ next ?
-                                                                     rng → fiber 2
-   r1 = y                                                y = 2       yield(seed)
-                  r2 = x                                              ──▶ next ?
-                                                                     rng → fiber 1
-                                            r1 = y
-                                                       r2 = x
-   ╳ непредсказуемо: разные                ╳ для seed=42 — всегда одна
-     trace при каждом запуске                и та же трасса, можно дебажить
-```
-
-Преимущество перед thread-based тестами:
-
-- **Воспроизводимость.** Race condition воспроизводится ровно тем же seed'ом, можно бежать `gdb --args ./tests --seed
-  42` и смотреть точку дивергенции.
-- **Покрытие interleaving'ов.** На preempted threads scheduler ОС обычно держит одного потока на ядре долго, мало
-  переключений. На fault-injection'е любой `yield` — точка переключения, traversal по interleaving'ам в десятки раз
-  плотнее.
-- **Model checking.** Если число interleaving'ов конечно (или сводится к нему через partial order reduction), можно
-  доказать отсутствие deadlock/race в полном пространстве — что обычный тест в принципе не может.
-
-Цена — код должен быть написан под этот runtime. Loom требует `loom::sync::Mutex` вместо `std::sync::Mutex`; обычный
-mutex проигнорируется и race останется не пойманным. Это вынуждает делать `#[cfg(loom)]`-ветки в production-коде, что
-часть команд считает приемлемой ценой за обнаруживаемые баги.
+    Кооперативные фиберы на POSIX `ucontext` (с fault injection): `examples/q15_fibers/fiber_ucontext.cpp` — собрать и запустить: `cd examples && make q15_ucontext && ./bin/q15_ucontext`.
 
 ## Почему glibc ucontext медленный
 
@@ -685,113 +488,70 @@ Boost.Context, libco, libaco не делают syscall'ов вообще. Их �
 Различие в философии: ucontext «корректен» (signal-safe), boost::context «быстр» (signal-unsafe — если на fiber придёт
 сигнал, маска не та, что положена).
 
-## Stackful vs stackless coroutines
+## Собственный context switch на asm
 
-Все варианты coroutine'ов делятся на два класса.
+`setjmp`/`longjmp` умеет прыгать только «назад» (в уже исполнявшийся фрейм), `ucontext` корректен, но платит двумя
+syscall'ами за signal mask. Чтобы переключаться между несколькими контекстами в обе стороны и без участия ядра, switch
+пишут руками на ассемблере. Это путь Boost.Context (`jump_fcontext`), libco, libaco — и наш `examples/q15_fibers`.
 
-**Stackful**: каждая coroutine получает свой стек. Переключение — это смена `rsp`, ровно как в `swapcontext`. `yield`
-можно сделать из любой глубины вложенности — стек этой нити просто откладывается до момента resume.
+Идея ровно та же, что у `setjmp`, но симметричная: сохранить callee-saved уходящего контекста на **его же** стек,
+подменить `rsp` на стек приходящего, восстановить **его** callee-saved и сделать `ret`. По SysV AMD64 ABI сохранять надо
+только `rbx`, `rbp`, `r12`–`r15` и сам `rsp`. Caller-saved (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`, xmm) трогать
+не нужно — их и так считает убитыми любой вызов функции, а switch для вызывающего и есть обычный вызов.
 
-```
-Stackful coroutine A           Coroutine B
-┌────────────────────┐        ┌────────────────────┐
-│   stack_A          │        │   stack_B          │
-│  ┌──────────────┐  │        │  ┌──────────────┐  │
-│  │ helper()     │  │        │  │ helper()     │  │
-│  ├──────────────┤  │        │  ├──────────────┤  │
-│  │ work()       │  │        │  │ work()       │  │
-│  ├──────────────┤  │        │  ├──────────────┤  │
-│  │ coro_A()     │  │        │  │ coro_B()     │  │
-│  └──────────────┘  │        │  └──────────────┘  │
-└────────────────────┘        └────────────────────┘
-        ▲                              ▲
-        │                              │
-        └────────── swap(rsp) ─────────┘
-   currently running              suspended
-```
-
-Стек — это full backed memory (обычно 4–64 KB на coroutine). Для миллиона coroutine'ов — гигабайты адресного
-пространства. На 64-битке это терпимо (резервируешь без commit'а через `mmap`), на 32-битке — нет.
-
-**Stackless**: компилятор разбивает функцию coroutine'ы на state machine. Каждая `await`-точка — отдельное состояние,
-локальные переменные хранятся в куче в «frame'е coroutine'ы». При resume вызывается обычный function call с
-восстановлением state из frame'а.
-
-```
-Stackless coroutine — что генерирует компилятор
-
-Source:                          Generated:
-                                 struct coro_frame {
-async fn worker() {                 int state;
-   let x = io_a().await;            int x;             // ← локалка в куче
-   let y = io_b(x).await;           int y;
-   return x + y;                 };
-}                                void coro_resume(coro_frame *f) {
-                                    switch (f->state) {
-                                       case 0: f->x = io_a();
-                                               f->state = 1; return;
-                                       case 1: f->y = io_b(f->x);
-                                               f->state = 2; return;
-                                       case 2: return f->x + f->y;
-                                    }
-                                 }
+```asm
+/* void fiber_switch(void** save_sp, void* restore_sp)
+ *   rdi = save_sp     — куда записать rsp уходящего контекста
+ *   rsi = restore_sp  — откуда взять rsp приходящего контекста */
+fiber_switch:
+    pushq %rbp                 /* сохраняем callee-saved уходящего контекста */
+    pushq %rbx                 /* на его же стек */
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, (%rdi)          /* *save_sp = rsp — запомнили вершину уходящего */
+    movq %rsi, %rsp            /* rsp = restore_sp — переключили стек */
+    popq %r15                  /* снимаем callee-saved приходящего контекста */
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    ret                        /* прыжок по сохранённому адресу возврата приходящего */
 ```
 
-`yield` возможен только из самой coroutine, не из вложенной обычной функции — у обычной функции нет state machine'ы. Это
-known restriction Rust async, Python `async`/`await`, C++20 coroutine'ов.
+Почему это работает:
 
-| Свойство                    | Stackful                       | Stackless                          |
-|-----------------------------|--------------------------------|------------------------------------|
-| Память на coroutine         | ≥ 4 KB (целый стек)            | sizeof(frame), типично 64–256 B    |
-| Switch cost                 | ~20 нс (jump_fcontext)         | ~5 нс (обычный call)               |
-| Yield из вложенной функции  | да                             | нет                                |
-| Заразность (function color) | нет — обычные функции работают | да — нужен `async`/`await` повсюду |
-| Реализация                  | runtime (asm + alloc стека)    | compiler (frontend трансформация)  |
-| Примеры                     | ucontext, Boost.Context, Go    | C++20, Rust async, Python async    |
+1. Шесть `pushq` кладут callee-saved на стек уходящего контекста. Адрес возврата (куда вернётся `ret`) положил `call
+   fiber_switch` ещё раньше — он лежит **над** этими шестью словами.
+2. `movq %rsp, (%rdi)` сохраняет вершину уходящего стека в `*save_sp`. Этого одного указателя достаточно, чтобы потом
+   полностью восстановить контекст: всё его состояние лежит на его стеке.
+3. `movq %rsi, %rsp` — единственная «магия». Сменив `rsp`, мы оказались на чужом стеке, и дальше все `popq` снимают
+   **чужие** callee-saved.
+4. `ret` снимает со стека адрес возврата приходящего контекста — тот, который он сохранил, когда сам в прошлый раз
+   уходил через `fiber_switch`. Управление прыгает туда, откуда чужой контекст ушёл.
 
-Go формально stackful (горутины с растущим стеком), но компилятор и runtime тесно завязаны — yield не делается через
-явный `swapcontext`, его вставляет компилятор в точках safe point (вызовы функций).
+`rip` нигде явно не сохраняется: его кладёт `call` и снимает `ret`, он живёт на стеке прямо под слотами callee-saved.
+Ни syscall'а, ни барьера памяти — шесть записей, шесть чтений, один `ret`, ~15–25 тактов в горячем кэше (единицы
+наносекунд).
 
-## C++20 coroutines (кратко)
+Что добавляет «боевой» `jump_fcontext` поверх этого скелета:
 
-C++20 принёс stackless coroutine'ы как языковую фичу. Три ключевых слова: `co_await`, `co_yield`, `co_return`. Любая
-функция, содержащая хотя бы одно из них, становится coroutine'ой.
+| Деталь                          | Зачем                                                                       |
+|---------------------------------|------------------------------------------------------------------------------|
+| `transfer_t {fctx, data}`       | двусторонний обмен: при возврате узнаёшь, кто тебя разбудил, и получаешь data |
+| `stmxcsr`/`fnstcw` (MXCSR, x87) | сохранить режим округления/исключений SSE и x87 control word                  |
+| `jmp *reg` вместо `ret`         | приёмник передаёт data в регистрах — нужен явный прыжок, а не `ret`           |
 
-```cpp
-#include <coroutine>
-#include <iostream>
+Первый запуск нового контекста требует подготовить ему «фейковый» стек, чтобы первый `fiber_switch` на него «вернулся»
+в стартовую функцию через trampoline — это делает `make_fcontext`/`make_context`. Разбор trampoline и того, как поверх
+этого switch строится scheduler, work-stealing и M:N-runtime — в статье [Stackful fibers](fibers.md). Stackless-вариант,
+где компилятор вообще убирает отдельный стек, — в [C++20 coroutines](coroutines_cpp20.md).
 
-struct Task {
-    struct promise_type {
-        Task get_return_object() { return {}; }
-        std::suspend_never initial_suspend() { return {}; }
-        std::suspend_never final_suspend() noexcept { return {}; }
-        void return_void() {}
-        void unhandled_exception() {}
-    };
-};
-
-Task hello(void) {
-    std::cout << "before await\n";
-    co_await std::suspend_always{};
-    std::cout << "after await\n";          // никогда не выполнится в этом примере
-}
-```
-
-Под капотом компилятор для каждой coroutine'ы:
-
-1. Генерирует структуру «coroutine frame» — туда упаковываются параметры, локальные переменные, переходящие через
-   `co_await`, и поле текущего состояния.
-2. Аллоцирует frame в куче (или вылазит в caller'а через HALO-оптимизацию).
-3. Разбивает тело функции на участки между `co_await`-точками; каждый участок становится case'ом switch'а.
-4. Resume — это вызов сгенерированного `__coro_resume(frame*)`, по сути обычный call.
-
-Стоимость resume — единицы наносекунд, потому что это и есть обычный function call. Никакого `swapcontext`, никакого
-стека. Frame локален, что отлично ложится на cache.
-
-Что C++20 coroutine'ы **не** делают — yield из вложенных обычных функций. Если внутри `hello` вы вызовете
-`parse_request()` (не coroutine), а внутри неё захотите подождать сетевого ответа, вам придётся либо сделать
-`parse_request` тоже coroutine'ой (заражение), либо переключиться на stackful fibers.
+!!! example "Рабочий пример"
+    Собственный asm-switch и фиберы поверх него: `examples/q15_fibers/context_switch.S` + `fiber_asm.cpp` (свой switch)
+    и `fiber_ucontext.cpp` (через POSIX `ucontext`). Собрать: `cd examples && make q15` (цели `q15_asm`, `q15_ucontext`).
 
 ## Сравнение стоимости context switching
 
@@ -856,6 +616,8 @@ Stackless coroutine — predельный случай: state хранится в
 - [Сигналы](../processes/signals.md) — почему `sigsetjmp`/`siglongjmp`, а не обычные `setjmp`/`longjmp` в signal
   handler'ах
 - [Потоки (основы)](threads_basics.md) — pthread = kernel threads (1:1) vs userspace fibers (M:N)
+- [Stackful fibers](fibers.md) — scheduler, trampoline, work-stealing, M:N-runtime поверх asm-switch
+- [C++20 coroutines](coroutines_cpp20.md) — stackless-вариант: state machine вместо отдельного стека
 
 ## Источники
 

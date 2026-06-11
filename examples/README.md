@@ -43,7 +43,7 @@ kill %1
 | 8 | `q08_three_state_mutex/` | test | мьютекс на трёх состояниях | [thread_synchronization](../sections/concurrency/thread_synchronization.md) |
 | 9 | `q09_condvar_futex/` | test | condition_variable через futex, счётчик поколений | [thread_synchronization](../sections/concurrency/thread_synchronization.md) |
 | 10 | `q10_nonblocking_busyloop/` | demo | неблокирующие read/write, busy-loop polling | [tcp_servers](../sections/concurrency/tcp_servers.md) |
-| 11 | `q11_epoll_server/` | demo | select/poll/epoll, сервер через epoll | [io_multiplexing](../sections/networking/io_multiplexing.md) |
+| 11 | `q11_epoll_server/` | demo | select / poll / epoll — три echo-сервера для сравнения API (`q11_select`, `q11_poll`, `q11_epoll`) | [io_multiplexing](../sections/networking/io_multiplexing.md) |
 | 12 | `q12_io_uring_server/` | demo | io_uring, сервер через io_uring | [io_uring](../sections/networking/io_uring.md) |
 | 13 | `q13_future_promise/` | demo | Future/Promise, callback hell, chaining | [future_promise](../sections/concurrency/future_promise.md) |
 | 14 | `q14_future_impl/` | test | реализация std::future/std::promise | [future_promise](../sections/concurrency/future_promise.md) |
