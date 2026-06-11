@@ -1,0 +1,39 @@
+.md-grid {
+  max-width: 73rem;
+}
+
+.md-content__inner {
+  padding-left: 0.8rem;
+  padding-right: 0.8rem;
+}
+
+.md-typeset .highlight,
+.md-typeset pre {
+  width: fit-content;
+  max-width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.md-typeset pre > code {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  white-space: pre;
+}
+
+.md-typeset .mermaid {
+  text-align: center;
+}
+
+.md-typeset .mermaid svg {
+  margin-left: auto;
+  margin-right: auto;
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.md-typeset table:not([class]) {
+  display: table;
+  width: auto;
+}

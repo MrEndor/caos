@@ -3,6 +3,9 @@ site_description: Материалы курса по архитектуре ко
 site_author: Egor Zherdev
 docs_dir: sections
 
+extra_css:
+  - assets/extra.css
+
 theme:
   name: material
   language: ru
