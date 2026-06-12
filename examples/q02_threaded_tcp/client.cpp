@@ -3,6 +3,8 @@
 // socket() -> connect(127.0.0.1:8080) -> send(строка) -> recv(echo) -> print.
 // Строку берём из argv[1], по умолчанию "hello".
 //
+// Структура файла: namespace net (слой сокетов) + EchoClient.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q02_threaded_tcp/client.cpp -o bin/q02_client
 // run:     ./bin/q02_client "сообщение"
 
@@ -10,7 +12,6 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -22,27 +23,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr std::size_t kBufferSize = 4096;
-constexpr const char* kServerIp = "127.0.0.1";
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -52,17 +49,10 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
 private:
     void reset() noexcept {
@@ -147,19 +137,33 @@ std::string receive_echo(int sock_fd, std::size_t expected) {
     return std::string{buffer.data(), received};
 }
 
-// Отправить сообщение и вернуть полученный echo-ответ.
-std::string send_and_receive(int sock_fd, std::string_view message) {
-    send_all(sock_fd, message);
-    return receive_echo(sock_fd, message.size());
-}
+}  // namespace net
+
+// ───────────────────────── клиент ─────────────────────────
+namespace {
+
+// Echo-клиент: владеет соединением, request() = отправить и забрать echo-ответ.
+class EchoClient {
+public:
+    EchoClient(const char* host, std::uint16_t port)
+        : sock_{net::connect_to(host, port)} {}
+
+    std::string request(std::string_view message) {
+        net::send_all(sock_.get(), message);
+        return net::receive_echo(sock_.get(), message.size());
+    }
+
+private:
+    net::FileDescriptor sock_;
+};
 
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string message = (argc > 1) ? argv[1] : "hello";
     try {
-        const FileDescriptor sock = connect_to(kServerIp, kPort);
-        const std::string echo = send_and_receive(sock.get(), message);
+        EchoClient client{"127.0.0.1", 8080};
+        const std::string echo = client.request(message);
         std::cout << "echo (" << echo.size() << " байт): " << echo << '\n';
     } catch (const std::system_error& error) {
         std::cerr << "ошибка: " << error.what() << '\n';

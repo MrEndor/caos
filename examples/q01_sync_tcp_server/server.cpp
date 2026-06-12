@@ -6,13 +6,17 @@
 // Один поток = один клиент в каждый момент времени. Это мотивация для
 // многопоточности (q02), неблокирующего I/O (q10) и epoll (q11).
 //
+// Структура файла (всё в одном .cpp, как и остальные примеры):
+//   namespace net  — переиспользуемый слой сокетов (RAII fd, listener, write_all);
+//   SyncEchoServer — сам сервер: владеет listener'ом, цикл accept + обслуживание.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q01_sync_tcp_server/server.cpp -o bin/q01_server
 // run:     ./bin/q01_server        (затем в другом терминале: nc 127.0.0.1 8080)
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <utility>
@@ -22,11 +26,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 16;  // длина очереди ожидающих accept() соединений
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 // Запрещаем копирование, разрешаем перемещение (владение единственное).
@@ -34,16 +37,13 @@ class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -53,17 +53,10 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
 private:
     void reset() noexcept {
@@ -119,8 +112,7 @@ bool write_all(int client_fd, const char* data, std::size_t count) {
     while (written < count) {
         const ssize_t chunk = ::write(client_fd, data + written, count - written);
         if (chunk < 0) {
-            // EINTR — системный вызов прерван сигналом, просто повторяем.
-            if (errno == EINTR) {
+            if (errno == EINTR) {   // прерван сигналом — повторяем
                 continue;
             }
             std::perror("write");
@@ -131,68 +123,89 @@ bool write_all(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// Обрабатываем одного клиента целиком (echo) и возвращаемся.
-// На время этой функции сервер "занят" — новые клиенты ждут в backlog.
-void echo_loop(int client_fd) {
-    std::array<char, kBufferSize> buffer{};
-    // read() возвращает 0 при закрытии соединения клиентом (EOF).
-    for (;;) {
-        const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-        if (bytes_read > 0) {
-            if (!write_all(client_fd, buffer.data(),
-                           static_cast<std::size_t>(bytes_read))) {
-                return;
-            }
-        } else if (bytes_read == 0) {
-            return;  // нормальное закрытие со стороны клиента
-        } else {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("read");
-            return;
+}  // namespace net
+
+// ───────────────────────── сервер ─────────────────────────
+namespace {
+
+// Синхронный echo-сервер: принимает ОДНО соединение, обслуживает его целиком,
+// закрывает и только потом возвращается к accept() за следующим.
+class SyncEchoServer {
+public:
+    explicit SyncEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)}, port_{port} {}
+
+    void run() {
+        std::cout << "q01: синхронный сервер слушает порт " << port_
+                  << " (один клиент за раз)\n";
+        for (;;) {
+            accept_one();
         }
     }
-}
 
-// Главный цикл: принимаем ОДНО соединение, обслуживаем его полностью,
-// закрываем и только потом возвращаемся к accept() за следующим.
-void run_server() {
-    const FileDescriptor listener = make_listener(kPort);
-    std::cout << "q01: синхронный сервер слушает порт " << kPort
-              << " (один клиент за раз)\n";
+private:
+    static constexpr std::size_t kBufferSize = 4096;
 
-    for (;;) {
+    // Принять одно соединение и обслужить его до конца.
+    void accept_one() {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);  // корректный тип для accept
-        FileDescriptor client{::accept(
-            listener.get(), reinterpret_cast<sockaddr*>(&client_addr), &addr_len)};
+        net::FileDescriptor client{::accept(
+            listener_.get(), reinterpret_cast<sockaddr*>(&client_addr), &addr_len)};
         if (!client.valid()) {
             if (errno == EINTR) {
-                continue;  // прервано сигналом — повторяем
+                return;  // прервано сигналом — вернёмся в accept() на следующей итерации
             }
             std::perror("accept");
-            continue;  // не валим сервер из-за одного клиента
+            return;  // не валим сервер из-за одного клиента
         }
 
         std::array<char, INET_ADDRSTRLEN> ip{};
         ::inet_ntop(AF_INET, &client_addr.sin_addr, ip.data(), ip.size());
-        std::cout << "подключился " << ip.data() << ':'
-                  << ntohs(client_addr.sin_port)
+        const int peer_port = ntohs(client_addr.sin_port);
+        std::cout << "подключился " << ip.data() << ':' << peer_port
                   << " — обслуживаю (остальные ждут)\n";
 
         echo_loop(client.get());
 
-        std::cout << "клиент " << ip.data() << ':' << ntohs(client_addr.sin_port)
+        std::cout << "клиент " << ip.data() << ':' << peer_port
                   << " отключён, готов принять следующего\n";
     }
-}
+
+    // Echo одного клиента целиком. На время этой функции сервер "занят" —
+    // новые клиенты ждут в backlog.
+    static void echo_loop(int client_fd) {
+        std::array<char, kBufferSize> buffer{};
+        // read() возвращает 0 при закрытии соединения клиентом (EOF).
+        for (;;) {
+            const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
+            if (bytes_read > 0) {
+                if (!net::write_all(client_fd, buffer.data(),
+                                    static_cast<std::size_t>(bytes_read))) {
+                    return;
+                }
+            } else if (bytes_read == 0) {
+                return;  // нормальное закрытие со стороны клиента
+            } else {
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::perror("read");
+                return;
+            }
+        }
+    }
+
+    net::FileDescriptor listener_;
+    std::uint16_t       port_;
+};
 
 }  // namespace
 
 int main() {
     try {
-        run_server();
+        SyncEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;

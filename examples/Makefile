@@ -32,7 +32,7 @@ DEMO_TARGETS := \
 # ── GoogleTest (проверка корректности) ──
 TEST_TARGETS := \
   q03_test q04_test q05_test q07_test q08_test q09_test \
-  q14_test q16_test q18_test q19_test q20_test q21_test
+  q14_test q16_test q16_lowering_test q16_symmetric_test q18_test q19_test q20_test q21_test
 
 # ── GoogleBenchmark (замер времени/throughput) ──
 BENCH_TARGETS := q05_bench q06_bench q17_bench
@@ -68,6 +68,8 @@ q08_test: ; $(CXX) $(CXXFLAGS) q08_three_state_mutex/three_state_test.cpp -o $(B
 q09_test: ; $(CXX) $(CXXFLAGS) q09_condvar_futex/condvar_futex_test.cpp   -o $(BIN)/$@ $(GTEST)
 q14_test: ; $(CXX) $(CXXFLAGS) q14_future_impl/my_future_test.cpp         -o $(BIN)/$@ $(GTEST)
 q16_test: ; $(CXX) $(CXXFLAGS) q16_coroutines/generator_task_test.cpp     -o $(BIN)/$@ $(GTEST)
+q16_lowering_test: ; $(CXX) $(CXXFLAGS) q16_coroutines/coroutine_lowering_test.cpp -o $(BIN)/$@ $(GTEST)
+q16_symmetric_test: ; $(CXX) $(CXXFLAGS) q16_coroutines/symmetric_transfer_test.cpp -o $(BIN)/$@ $(GTEST)
 q18_test: ; $(CXX) $(CXXFLAGS) q18_treiber_stack/treiber_stack_test.cpp   -o $(BIN)/$@ $(GTEST) $(ATOMIC)
 q19_test: ; $(CXX) $(CXXFLAGS) q19_ms_queue/ms_queue_test.cpp             -o $(BIN)/$@ $(GTEST) $(ATOMIC)
 q20_test: ; $(CXX) $(CXXFLAGS) q20_atomic_shared_ptr/atomic_sp_test.cpp   -o $(BIN)/$@ $(GTEST) $(ATOMIC)
@@ -101,7 +103,7 @@ q12: q12_server
 q13: q13_demo
 q14: q14_test
 q15: q15_ucontext q15_asm
-q16: q16_test
+q16: q16_test q16_lowering_test q16_symmetric_test
 q17: q17_bench
 q18: q18_test
 q19: q19_test

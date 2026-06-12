@@ -20,13 +20,15 @@
 // читаем по одному буферу за готовность; пока в сокете есть данные, select
 // будет снова отмечать его готовым. EOF/ошибка -> закрыть и убрать из списка.
 //
+// Структура файла: namespace net (слой сокетов) + SelectEchoServer.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q11_epoll_server/select_server.cpp -o bin/q11_select
 // run:     ./bin/q11_select     (nc 127.0.0.1 8080)
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <utility>
@@ -39,11 +41,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 128;
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 // release() отдаёт владение наружу (нужно, когда fd начинает жить в нашем
@@ -52,16 +53,13 @@ class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -71,22 +69,13 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
     // Отдать владение дескриптором наружу, не закрывая его.
-    [[nodiscard]] int release() noexcept {
-        return std::exchange(fd_, -1);
-    }
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
 
 private:
     void reset() noexcept {
@@ -170,116 +159,136 @@ bool write_all(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// LT-чтение: читаем ОДИН буфер и эхо-отвечаем. При level-triggered этого
-// достаточно — если данные остались, select снова отметит сокет готовым на
-// следующей итерации. Возвращает true, если соединение надо закрыть.
-bool read_once(int client_fd) {
-    std::array<char, kBufferSize> buffer{};
-    const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-    if (bytes_read > 0) {
-        return !write_all(client_fd, buffer.data(),
-                          static_cast<std::size_t>(bytes_read));
-    }
-    if (bytes_read == 0) {
-        return true;  // EOF — клиент закрыл соединение
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        return false;  // ложная готовность/прерывание — оставляем жить
-    }
-    std::perror("read");
-    return true;
-}
+}  // namespace net
 
-// Принять одно ожидающее соединение и добавить его в список клиентов.
-// Listen-сокет неблокирующий, поэтому accept не подвиснет.
-void accept_client(int listen_fd, std::vector<int>& clients) {
-    FileDescriptor client{::accept(listen_fd, nullptr, nullptr)};
-    if (!client.valid()) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            std::perror("accept");
-        }
-        return;
-    }
-    if (!set_nonblocking(client.get())) {
-        return;  // client закроется в деструкторе
-    }
-    // Жёсткое ограничение select: за номером fd >= FD_SETSIZE следить нельзя.
-    if (client.get() >= FD_SETSIZE) {
-        std::cerr << "fd " << client.get()
-                  << " >= FD_SETSIZE, select не потянет, drop\n";
-        return;  // client закроется в деструкторе
-    }
-    clients.push_back(client.release());  // владение переходит в список
-}
+// ───────────────────────── сервер ─────────────────────────
+namespace {
 
-// Пересобрать read_set с нуля: listen + все клиенты. Это и есть «боль»
-// select — набор разрушается каждым вызовом, поэтому строим заново КАЖДЫЙ
-// раз. Возвращает max_fd (select требует nfds = max_fd + 1).
-int rebuild_read_set(fd_set& read_set, int listen_fd,
-                     const std::vector<int>& clients) {
-    FD_ZERO(&read_set);
-    FD_SET(listen_fd, &read_set);
-    int max_fd = listen_fd;
-    for (const int client_fd : clients) {
-        FD_SET(client_fd, &read_set);
-        if (client_fd > max_fd) {
-            max_fd = client_fd;
-        }
-    }
-    return max_fd;
-}
+// Echo-сервер на select. Держит listen-сокет и список клиентских fd (raw int,
+// закрываются вручную); на каждой итерации пересобирает fd_set, спит в select
+// и O(N) обходит готовые дескрипторы.
+class SelectEchoServer {
+public:
+    explicit SelectEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)}, port_{port} {}
 
-// O(N) проход по клиентам после select: эхо для готовых, удаление закрытых.
-// Закрытые удаляем swap-and-pop (порядок не важен для echo-сервера).
-void service_clients(fd_set& read_set, std::vector<int>& clients) {
-    std::size_t index = 0;
-    while (index < clients.size()) {
-        const int client_fd = clients[index];
-        if (FD_ISSET(client_fd, &read_set) && read_once(client_fd)) {
+    ~SelectEchoServer() {
+        for (const int client_fd : clients_) {
             ::close(client_fd);
-            clients[index] = clients.back();
-            clients.pop_back();
-            continue;  // на это место встал последний — не инкрементируем
         }
-        ++index;
     }
-}
 
-// Главный цикл на select: на каждой итерации пересобираем fd_set, спим в
-// select, затем O(N) обходим listen и всех клиентов.
-void run_select_loop() {
-    const FileDescriptor listener = make_listener(kPort);
-    std::vector<int> clients;
+    SelectEchoServer(const SelectEchoServer&) = delete;
+    SelectEchoServer& operator=(const SelectEchoServer&) = delete;
 
-    std::cout << "q11: select сервер слушает порт " << kPort << '\n';
+    void run() {
+        std::cout << "q11: select сервер слушает порт " << port_ << '\n';
+        for (;;) {
+            // fd_set разрушается каждым select -> строим заново (O(N)).
+            fd_set read_set;
+            const int max_fd = rebuild_read_set(read_set);
 
-    for (;;) {
-        // fd_set разрушается каждым select -> строим заново (O(N)).
-        fd_set read_set;
-        const int max_fd = rebuild_read_set(read_set, listener.get(), clients);
-
-        // timeout = nullptr -> ждать бесконечно. (Если бы передавали timeval,
-        // его пришлось бы переустанавливать: Linux пишет в него остаток.)
-        const int ready = ::select(max_fd + 1, &read_set, nullptr, nullptr, nullptr);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;  // прервано сигналом
+            // timeout = nullptr -> ждать бесконечно. (Если бы передавали timeval,
+            // его пришлось бы переустанавливать: Linux пишет в него остаток.)
+            const int ready =
+                ::select(max_fd + 1, &read_set, nullptr, nullptr, nullptr);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;  // прервано сигналом
+                }
+                std::perror("select");
+                break;
             }
-            std::perror("select");
-            break;
-        }
 
-        // Новые соединения: listen-сокет готов на чтение = есть кого accept.
-        if (FD_ISSET(listener.get(), &read_set)) {
-            accept_client(listener.get(), clients);
+            // Новые соединения: listen-сокет готов на чтение = есть кого accept.
+            if (FD_ISSET(listener_.get(), &read_set)) {
+                accept_client();
+            }
+            service_clients(read_set);
         }
-        service_clients(read_set, clients);
     }
 
-    for (const int client_fd : clients) {
-        ::close(client_fd);
+private:
+    static constexpr std::size_t kBufferSize = 4096;
+
+    // Пересобрать read_set с нуля: listen + все клиенты. Это и есть «боль»
+    // select — набор разрушается каждым вызовом. Возвращает max_fd
+    // (select требует nfds = max_fd + 1).
+    int rebuild_read_set(fd_set& read_set) const {
+        FD_ZERO(&read_set);
+        FD_SET(listener_.get(), &read_set);
+        int max_fd = listener_.get();
+        for (const int client_fd : clients_) {
+            FD_SET(client_fd, &read_set);
+            if (client_fd > max_fd) {
+                max_fd = client_fd;
+            }
+        }
+        return max_fd;
     }
-}
+
+    // Принять одно ожидающее соединение и добавить его в список клиентов.
+    void accept_client() {
+        net::FileDescriptor client{::accept(listener_.get(), nullptr, nullptr)};
+        if (!client.valid()) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                std::perror("accept");
+            }
+            return;
+        }
+        if (!net::set_nonblocking(client.get())) {
+            return;  // client закроется в деструкторе
+        }
+        // Жёсткое ограничение select: за номером fd >= FD_SETSIZE следить нельзя.
+        if (client.get() >= FD_SETSIZE) {
+            std::cerr << "fd " << client.get()
+                      << " >= FD_SETSIZE, select не потянет, drop\n";
+            return;  // client закроется в деструкторе
+        }
+        clients_.push_back(client.release());  // владение переходит в список
+    }
+
+    // O(N) проход по клиентам после select: эхо для готовых, удаление закрытых
+    // через swap-and-pop (порядок не важен для echo-сервера).
+    void service_clients(fd_set& read_set) {
+        std::size_t index = 0;
+        while (index < clients_.size()) {
+            const int client_fd = clients_[index];
+            if (FD_ISSET(client_fd, &read_set) && read_once(client_fd)) {
+                ::close(client_fd);
+                clients_[index] = clients_.back();
+                clients_.pop_back();
+                continue;  // на это место встал последний — не инкрементируем
+            }
+            ++index;
+        }
+    }
+
+    // LT-чтение: читаем ОДИН буфер и эхо-отвечаем. При level-triggered этого
+    // достаточно — остаток select снова отметит готовым. Возвращает true, если
+    // соединение надо закрыть.
+    static bool read_once(int client_fd) {
+        std::array<char, kBufferSize> buffer{};
+        const ssize_t bytes_read =
+            ::read(client_fd, buffer.data(), buffer.size());
+        if (bytes_read > 0) {
+            return !net::write_all(client_fd, buffer.data(),
+                                   static_cast<std::size_t>(bytes_read));
+        }
+        if (bytes_read == 0) {
+            return true;  // EOF — клиент закрыл соединение
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return false;  // ложная готовность/прерывание — оставляем жить
+        }
+        std::perror("read");
+        return true;
+    }
+
+    net::FileDescriptor listener_;
+    std::vector<int>    clients_;  // raw fd: закрываем вручную / в деструкторе
+    std::uint16_t       port_;
+};
 
 }  // namespace
 
@@ -289,7 +298,8 @@ void run_select_loop() {
 //   epoll  : O(1) на готовый fd, ядро ведёт ready-list, масштаб до 100k+ соединений
 int main() {
     try {
-        run_select_loop();
+        SelectEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;

@@ -25,13 +25,15 @@
 // Логику воркера (epoll_wait + обработка) при этом просто запускают в каждом
 // std::thread. Здесь оставлен один поток для ясности сути epoll.
 //
+// Структура файла: namespace net (слой сокетов) + EpollEchoServer.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q11_epoll_server/server.cpp -o bin/q11_server
 // run:     ./bin/q11_server     (nc 127.0.0.1 8080)
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <utility>
@@ -43,12 +45,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 128;
-constexpr int kMaxEvents = 64;
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 // Используется и для обычных сокетов, и для epoll-fd. release() отдаёт
@@ -57,16 +57,13 @@ class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -76,22 +73,13 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
     // Отдать владение дескриптором наружу, не закрывая его.
-    [[nodiscard]] int release() noexcept {
-        return std::exchange(fd_, -1);
-    }
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
 
 private:
     void reset() noexcept {
@@ -153,54 +141,9 @@ FileDescriptor make_listener(std::uint16_t port) {
     return listener;
 }
 
-// Зарегистрировать дескриптор в epoll с заданными событиями.
-// В data.fd кладём сам дескриптор для опознания при epoll_wait().
-bool add_to_epoll(int epoll_fd, int fd, std::uint32_t events) {
-    epoll_event event{};
-    event.events = events;
-    event.data.fd = fd;
-    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-        std::perror("epoll_ctl(ADD)");
-        return false;
-    }
-    return true;
-}
-
-// Снять дескриптор с epoll (перед close).
-void remove_from_epoll(int epoll_fd, int fd) {
-    ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-}
-
-// ET accept-loop: принимаем ВСЕ ожидающие коннекты, пока accept не вернёт
-// EAGAIN. При ET одно уведомление = надо вычерпать backlog полностью.
-// Принятые клиенты регистрируются в epoll как EPOLLIN | EPOLLET.
-void accept_all(int listen_fd, int epoll_fd) {
-    for (;;) {
-        FileDescriptor client{::accept(listen_fd, nullptr, nullptr)};
-        if (!client.valid()) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("accept");
-            break;
-        }
-        if (!set_nonblocking(client.get())) {
-            continue;  // client закроется в деструкторе
-        }
-        if (add_to_epoll(epoll_fd, client.get(), EPOLLIN | EPOLLET)) {
-            // fd теперь живёт в epoll-наборе: отдаём владение, чтобы деструктор
-            // не закрыл живой сокет. close сделаем вручную при EOF/ошибке.
-            (void)client.release();
-        }
-    }
-}
-
 // Записать ровно count байт (partial-write цикл).
 // Возвращает false при ошибке/переполнении буфера (соединение закрываем).
-bool write_all_et(int client_fd, const char* data, std::size_t count) {
+bool write_all(int client_fd, const char* data, std::size_t count) {
     std::size_t written = 0;
     while (written < count) {
         const ssize_t chunk = ::write(client_fd, data + written, count - written);
@@ -222,97 +165,158 @@ bool write_all_et(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// ET read drain-loop: читаем, пока не EAGAIN. Если прочитать не всё —
-// повторного EPOLLIN не будет! Возвращает true, если соединение надо закрыть.
-bool drain_client(int client_fd) {
-    std::array<char, kBufferSize> buffer{};
-    for (;;) {
-        const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-        if (bytes_read > 0) {
-            if (!write_all_et(client_fd, buffer.data(),
-                              static_cast<std::size_t>(bytes_read))) {
-                return true;  // ошибка записи — закрываем
-            }
-        } else if (bytes_read == 0) {
-            return true;  // EOF — клиент закрыл соединение
-        } else {
-            // EAGAIN -> буфер опустошён, выходим из drain-loop.
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return false;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("read");
-            return true;
+}  // namespace net
+
+// ───────────────────────── сервер ─────────────────────────
+namespace {
+
+// Echo-сервер на epoll в edge-triggered режиме. Владеет listen-сокетом и
+// epoll-дескриптором; run() спит в epoll_wait и обрабатывает готовые fd.
+class EpollEchoServer {
+public:
+    explicit EpollEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)},
+          epoll_fd_{::epoll_create1(0)},  // epoll_create1(0): современный аналог epoll_create
+          port_{port} {
+        if (!epoll_fd_.valid()) {
+            net::throw_errno("epoll_create1");
+        }
+        // Регистрируем listen-сокет: EPOLLIN (есть кого accept) | EPOLLET.
+        if (!add_to_epoll(listener_.get(), EPOLLIN | EPOLLET)) {
+            throw std::system_error{errno, std::generic_category(),
+                                    "epoll_ctl(ADD listen)"};
         }
     }
-}
 
-// Обработать одно готовое событие epoll.
-void handle_event(const epoll_event& event, int listen_fd, int epoll_fd) {
-    const int fd = event.data.fd;
-
-    // Ошибка/закрытие на дескрипторе.
-    if (event.events & (EPOLLERR | EPOLLHUP)) {
-        remove_from_epoll(epoll_fd, fd);
-        ::close(fd);
-        return;
-    }
-
-    if (fd == listen_fd) {
-        accept_all(listen_fd, epoll_fd);
-        return;
-    }
-
-    if (drain_client(fd)) {
-        remove_from_epoll(epoll_fd, fd);
-        ::close(fd);
-    }
-}
-
-// Главный цикл: epoll_wait спит до события, затем обрабатываем готовые fd.
-void run_epoll_loop() {
-    const FileDescriptor listener = make_listener(kPort);
-
-    // epoll_create1(0): современный аналог epoll_create, аргумент-флаги.
-    const FileDescriptor epoll_fd{::epoll_create1(0)};
-    if (!epoll_fd.valid()) {
-        throw_errno("epoll_create1");
-    }
-
-    // Регистрируем listen-сокет: EPOLLIN (есть кого accept) | EPOLLET.
-    if (!add_to_epoll(epoll_fd.get(), listener.get(), EPOLLIN | EPOLLET)) {
-        throw std::system_error{errno, std::generic_category(),
-                                "epoll_ctl(ADD listen)"};
-    }
-
-    std::cout << "q11: epoll (ET) сервер слушает порт " << kPort << '\n';
-
-    std::array<epoll_event, kMaxEvents> events{};
-    for (;;) {
-        // -1 = ждать бесконечно; поток спит, пока ядро не разбудит событием.
-        const int ready =
-            ::epoll_wait(epoll_fd.get(), events.data(), kMaxEvents, -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;  // прервано сигналом
+    void run() {
+        std::cout << "q11: epoll (ET) сервер слушает порт " << port_ << '\n';
+        std::array<epoll_event, kMaxEvents> events{};
+        for (;;) {
+            // -1 = ждать бесконечно; поток спит, пока ядро не разбудит событием.
+            const int ready =
+                ::epoll_wait(epoll_fd_.get(), events.data(), kMaxEvents, -1);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;  // прервано сигналом
+                }
+                std::perror("epoll_wait");
+                break;
             }
-            std::perror("epoll_wait");
-            break;
-        }
-        for (int i = 0; i < ready; ++i) {
-            handle_event(events[static_cast<std::size_t>(i)],
-                         listener.get(), epoll_fd.get());
+            for (int i = 0; i < ready; ++i) {
+                handle_event(events[static_cast<std::size_t>(i)]);
+            }
         }
     }
-}
+
+private:
+    static constexpr int         kMaxEvents = 64;
+    static constexpr std::size_t kBufferSize = 4096;
+
+    // Зарегистрировать дескриптор в epoll с заданными событиями.
+    // В data.fd кладём сам дескриптор для опознания при epoll_wait().
+    bool add_to_epoll(int fd, std::uint32_t events) {
+        epoll_event event{};
+        event.events = events;
+        event.data.fd = fd;
+        if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &event) < 0) {
+            std::perror("epoll_ctl(ADD)");
+            return false;
+        }
+        return true;
+    }
+
+    // Снять дескриптор с epoll (перед close).
+    void remove_from_epoll(int fd) {
+        ::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, fd, nullptr);
+    }
+
+    // ET accept-loop: принимаем ВСЕ ожидающие коннекты, пока accept не вернёт
+    // EAGAIN. При ET одно уведомление = надо вычерпать backlog полностью.
+    void accept_all() {
+        for (;;) {
+            net::FileDescriptor client{::accept(listener_.get(), nullptr, nullptr)};
+            if (!client.valid()) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::perror("accept");
+                break;
+            }
+            if (!net::set_nonblocking(client.get())) {
+                continue;  // client закроется в деструкторе
+            }
+            if (add_to_epoll(client.get(), EPOLLIN | EPOLLET)) {
+                // fd теперь живёт в epoll-наборе: отдаём владение, чтобы деструктор
+                // не закрыл живой сокет. close сделаем вручную при EOF/ошибке.
+                (void)client.release();
+            }
+        }
+    }
+
+    // ET read drain-loop: читаем, пока не EAGAIN. Если прочитать не всё —
+    // повторного EPOLLIN не будет! Возвращает true, если соединение надо закрыть.
+    static bool drain_client(int client_fd) {
+        std::array<char, kBufferSize> buffer{};
+        for (;;) {
+            const ssize_t bytes_read =
+                ::read(client_fd, buffer.data(), buffer.size());
+            if (bytes_read > 0) {
+                if (!net::write_all(client_fd, buffer.data(),
+                                    static_cast<std::size_t>(bytes_read))) {
+                    return true;  // ошибка записи — закрываем
+                }
+            } else if (bytes_read == 0) {
+                return true;  // EOF — клиент закрыл соединение
+            } else {
+                // EAGAIN -> буфер опустошён, выходим из drain-loop.
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return false;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::perror("read");
+                return true;
+            }
+        }
+    }
+
+    // Обработать одно готовое событие epoll.
+    void handle_event(const epoll_event& event) {
+        const int fd = event.data.fd;
+
+        // Ошибка/закрытие на дескрипторе.
+        if (event.events & (EPOLLERR | EPOLLHUP)) {
+            remove_from_epoll(fd);
+            ::close(fd);
+            return;
+        }
+
+        if (fd == listener_.get()) {
+            accept_all();
+            return;
+        }
+
+        if (drain_client(fd)) {
+            remove_from_epoll(fd);
+            ::close(fd);
+        }
+    }
+
+    net::FileDescriptor listener_;
+    net::FileDescriptor epoll_fd_;
+    std::uint16_t       port_;
+};
 
 }  // namespace
 
 int main() {
     try {
-        run_epoll_loop();
+        EpollEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;

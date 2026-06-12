@@ -52,6 +52,18 @@ Wait-freedom — сильнейшее свойство, но дорогое: т�
 (announce-help-resolve pattern). Большинство практических lock-free структур не wait-free, а просто lock-free —
 этого хватает почти всегда.
 
+!!! warning "Lock-free — «по модулю аллокатора»"
+    Lock-freedom доказывают для самих CAS-операций **в предположении, что выделение памяти тоже lock-free**. А `new` /
+    `malloc` в `push` обычно берёт замок арены (в glibc — per-arena mutex): если поток, держащий этот замок, вытеснен,
+    остальные `push`'и встают. Строго говоря, `push`, который зовёт общий `malloc`, **не lock-free** — прогресс системы
+    может застопориться в аллокаторе, а не в самом алгоритме. То же касается `delete` при освобождении узлов (а у
+    reclamation вдобавок своя проблема — см. ниже).
+
+    Поэтому «настоящие» lock-free структуры не дёргают общий `malloc` на горячем пути: они **предвыделяют** узлы, держат
+    **lock-free free-list / пул объектов** или используют lock-free-аллокатор. Тогда свойство держится целиком. Учебные
+    реализации (включая нашу ниже) зовут `new`/`delete` ради простоты — код корректен, но **строго** lock-free лишь при
+    lock-free аллокаторе. Это честная придирка, и её полезно держать в голове.
+
 ## Treiber stack
 
 Простейшая lock-free структура — стек из односвязного списка с атомарным указателем на голову. Описана R. K. Treiber
@@ -332,7 +344,7 @@ Backoff используется повсеместно: glibc `pthread_mutex` a
 (первый CAS успешен) — overhead нулевой.
 
 !!! example "Рабочий пример"
-    Полная компилируемая реализация Treiber stack (lock-free push/pop через CAS): `examples/q18_treiber_stack/treiber_stack.cpp` — собрать и запустить: `cd examples && make q18 && ./bin/q18_treiber_stack`.
+    Полная компилируемая реализация Treiber stack (lock-free push/pop через CAS): `examples/q18_treiber_stack/treiber_stack_test.cpp`. Там же — собственный **lock-free node pool** (ABA-safe free-list через tag в голове), чтобы `push` не звал общий `malloc` (см. предупреждение выше), и **концепты** `Storable` / `NodePoolFor`. Конкурентный тест проверяет, что пул покрыл весь прогон (0 fallback'ов на `new`). Собрать и запустить: `cd examples && make q18_test && ./bin/q18_test`.
 
 ## ABA-проблема в Treiber stack
 

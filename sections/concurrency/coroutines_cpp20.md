@@ -127,7 +127,7 @@ struct fetch_and_log_frame {
   };
 ```
 
-Каждой паре `co_await x` соответствуют три состояния: `BEFORE_x` (вычисляется `await_ready`), `SUSPENDED_ON_x` (вернули control в caller, ждём `resume()`), `AFTER_x` (получили результат через `await_resume`).
+Каждой паре `co_await x` соответствуют три состояния: `BEFORE_x` (вычисляется `await_ready`), `SUSPENDED_ON_x` (вернули control в caller, ждём `resume()`), `AFTER_x` (получили результат через `await_resume`). Тонкость: на приостановке во фрейме хранится именно `AFTER_x` — точка, куда `switch` прыгнет при `resume()`; `SUSPENDED_ON_x` — это та же ситуация, но со стороны caller'а («управление вернулось, ждём `resume()`»), отдельным значением в `state` она не лежит.
 
 ### Ramp — синхронная часть вызова
 
@@ -147,12 +147,14 @@ Task<int> fetch_and_log(int id) {
     frame->state = fsm_state::INITIAL_SUSPEND;
     auto init_aw = frame->promise.initial_suspend();
     if (!init_aw.await_ready()) {
+        frame->state = fsm_state::BEFORE_READ;  // следующий resume() начнёт тело с (A)
         init_aw.await_suspend(coroutine_handle<promise_type>::from_promise(frame->promise));
         return ret;                            // приостановились перед телом — отдаём Task
     }
     init_aw.await_resume();
 
     // ── не приостановились — запускаем resume один раз ──
+    frame->state = fsm_state::BEFORE_READ;
     fetch_and_log_resume(frame);
     return ret;
 }
@@ -171,7 +173,7 @@ void fetch_and_log_resume(void* opaque) {
         new (&frame->read_aw) async_read_awaiter(frame->id);
 
         if (!frame->read_aw.await_ready()) {
-            frame->state = fsm_state::SUSPENDED_ON_READ;
+            frame->state = fsm_state::AFTER_READ;   // re-entry resume() прыгнет сюда
             frame->read_aw.await_suspend(
                 coroutine_handle<promise_type>::from_promise(frame->promise));
             return;                            // ↩ return to caller of resume()
@@ -194,7 +196,7 @@ void fetch_and_log_resume(void* opaque) {
         new (&frame->write_aw) async_write_awaiter(frame->doubled);
 
         if (!frame->write_aw.await_ready()) {
-            frame->state = fsm_state::SUSPENDED_ON_WRITE;
+            frame->state = fsm_state::AFTER_WRITE;   // re-entry resume() прыгнет сюда
             frame->write_aw.await_suspend(
                 coroutine_handle<promise_type>::from_promise(frame->promise));
             return;
@@ -230,6 +232,9 @@ void fetch_and_log_resume(void* opaque) {
 ```
 
 После suspend компилятор НЕ возвращается «из середины switch» — он выходит обычным `return`, контроль попадает в caller функции `resume()`. Когда awaiter позже зовёт `handle.resume()`, происходит **повторный вход** в `fetch_and_log_resume(frame)`, и `switch` прыгает на нужное состояние.
+
+!!! example "Рабочий пример"
+    Исполняемая версия этого разбора: `examples/q16_coroutines/coroutine_lowering_test.cpp` — рядом стоят настоящая корутина и написанный РУКАМИ тот же state machine (frame + resume-switch по состояниям), а тест проверяет, что они дают **тот же результат за то же число `resume`**. Собрать: `cd examples && make q16_lowering_test && ./bin/q16_lowering_test`.
 
 ### Жизненный цикл по состояниям
 
@@ -777,7 +782,7 @@ sequenceDiagram
 по обычному C++ стеку.
 
 !!! example "Рабочий пример"
-    Полная компилируемая реализация `Generator<T>` (через `co_yield`) и `Task<T>` (awaitable result с `co_await`/`co_return`): `examples/q16_coroutines/generator_task.cpp` — собрать и запустить: `cd examples && make q16 && ./bin/q16_coroutines`.
+    Полная компилируемая реализация `Generator<T>` (через `co_yield`) и `Task<T>` (awaitable result с `co_await`/`co_return`): `examples/q16_coroutines/generator_task_test.cpp` — собрать и запустить: `cd examples && make q16_test && ./bin/q16_test`.
 
 ## Symmetric transfer (P0913)
 
@@ -908,6 +913,9 @@ sequenceDiagram
 С symmetric transfer + `noop_coroutine` глубина цепочки **ограничена только heap'ом** (где живут frame'ы) — стек
 переиспользуется. Production-серверы делают цепочки длиной в миллионы await'ов на одной chain'е (например, recursive
 parsing async grammar) без проблем со стеком.
+
+!!! example "Рабочий пример"
+    `examples/q16_coroutines/symmetric_transfer_test.cpp` — `Task<T>` с symmetric transfer (`await_suspend` возвращает handle callee, `final_suspend` — continuation либо `noop_coroutine`). Тест `sum_to(n)` рекурсивно `co_await`'ит `sum_to(n-1)` на глубину **100000**: наивный `cont.resume()` тут переполнил бы стек, а symmetric transfer держит его постоянным — тест проходит, и это и есть доказательство. Собрать: `cd examples && make q16_symmetric_test && ./bin/q16_symmetric_test`.
 
 Без symmetric transfer C++20 coroutines были бы demo-фичей. Все production-библиотеки (cppcoro, folly::coro, asio
 awaitable) построены вокруг него.

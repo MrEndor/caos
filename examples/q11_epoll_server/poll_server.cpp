@@ -21,13 +21,15 @@
 // Семантика LEVEL-TRIGGERED (как у select): читаем по одному буферу за
 // готовность; пока есть данные, poll снова отметит POLLIN.
 //
+// Структура файла: namespace net (слой сокетов) + PollEchoServer.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q11_epoll_server/poll_server.cpp -o bin/q11_poll
 // run:     ./bin/q11_poll     (nc 127.0.0.1 8080)
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <utility>
@@ -40,11 +42,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 128;
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 // release() отдаёт владение наружу (нужно, когда fd начинает жить в массиве
@@ -53,16 +54,13 @@ class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -72,22 +70,13 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
     // Отдать владение дескриптором наружу, не закрывая его.
-    [[nodiscard]] int release() noexcept {
-        return std::exchange(fd_, -1);
-    }
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
 
 private:
     void reset() noexcept {
@@ -171,119 +160,137 @@ bool write_all(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// LT-чтение: читаем ОДИН буфер и эхо-отвечаем. При level-triggered этого
-// достаточно — остаток данных даст POLLIN на следующей итерации.
-// Возвращает true, если соединение надо закрыть.
-bool read_once(int client_fd) {
-    std::array<char, kBufferSize> buffer{};
-    const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-    if (bytes_read > 0) {
-        return !write_all(client_fd, buffer.data(),
-                          static_cast<std::size_t>(bytes_read));
-    }
-    if (bytes_read == 0) {
-        return true;  // EOF — клиент закрыл соединение
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        return false;  // ложная готовность/прерывание — оставляем жить
-    }
-    std::perror("read");
-    return true;
-}
+}  // namespace net
 
-// Принять одно ожидающее соединение и добавить новый pollfd с POLLIN.
-// fd живёт теперь в массиве fds, поэтому release().
-void accept_client(int listen_fd, std::vector<pollfd>& fds) {
-    FileDescriptor client{::accept(listen_fd, nullptr, nullptr)};
-    if (!client.valid()) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            std::perror("accept");
-        }
-        return;
+// ───────────────────────── сервер ─────────────────────────
+namespace {
+
+// Echo-сервер на poll. Держит массив pollfd (индекс 0 — listen). Массив
+// переиспользуется между вызовами poll; закрытые клиенты помечаются fd = -1
+// и убираются отдельным compact-проходом.
+class PollEchoServer {
+public:
+    explicit PollEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)}, port_{port} {
+        // Индекс 0 — listen-сокет с POLLIN (готов = есть кого accept).
+        pollfd listen_entry{};
+        listen_entry.fd = listener_.get();
+        listen_entry.events = POLLIN;
+        listen_entry.revents = 0;
+        fds_.push_back(listen_entry);
     }
-    if (!set_nonblocking(client.get())) {
-        return;  // client закроется в деструкторе
-    }
-    pollfd entry{};
-    entry.fd = client.release();  // владение переходит в массив
-    entry.events = POLLIN;
-    entry.revents = 0;
-    fds.push_back(entry);
-}
 
-// O(N) проход по массиву pollfd после возврата poll. Индекс 0 — listen.
-// Закрытые клиенты помечаем fd = -1, чтобы не двигать массив прямо в цикле
-// (poll такие слоты игнорирует), компактим отдельным проходом.
-void service_pollfds(std::vector<pollfd>& fds, int listen_fd) {
-    for (std::size_t index = 0; index < fds.size(); ++index) {
-        const short revents = fds[index].revents;
-        if (revents == 0) {
-            continue;  // этот дескриптор не готов
-        }
-        if (fds[index].fd == listen_fd) {
-            accept_client(listen_fd, fds);  // может добавить элементы в конец
-            continue;
-        }
-        // POLLHUP/POLLERR/POLLNVAL = клиент отвалился или ошибка.
-        const bool failed = (revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
-        if (failed || (((revents & POLLIN) != 0) && read_once(fds[index].fd))) {
-            ::close(fds[index].fd);
-            fds[index].fd = -1;  // помечаем слот на удаление
-        }
-    }
-}
-
-// Убрать помеченные (fd == -1) слоты swap-and-pop. Listen (индекс 0) никогда
-// не помечается, поэтому остаётся на месте.
-void compact_pollfds(std::vector<pollfd>& fds) {
-    std::size_t index = 0;
-    while (index < fds.size()) {
-        if (fds[index].fd < 0) {
-            fds[index] = fds.back();
-            fds.pop_back();
-            continue;  // на место встал последний — не инкрементируем
-        }
-        ++index;
-    }
-}
-
-// Главный цикл на poll: массив pollfd переиспользуется между вызовами,
-// ядро само сбрасывает .revents. Спим в poll, обрабатываем, компактим.
-void run_poll_loop() {
-    const FileDescriptor listener = make_listener(kPort);
-
-    // Индекс 0 — listen-сокет с POLLIN (готов = есть кого accept).
-    std::vector<pollfd> fds;
-    pollfd listen_entry{};
-    listen_entry.fd = listener.get();
-    listen_entry.events = POLLIN;
-    listen_entry.revents = 0;
-    fds.push_back(listen_entry);
-
-    std::cout << "q11: poll сервер слушает порт " << kPort << '\n';
-
-    for (;;) {
-        // -1 = ждать бесконечно. Массив НЕ пересобираем — лишь передаём его.
-        const int ready = ::poll(fds.data(), fds.size(), -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;  // прервано сигналом
+    ~PollEchoServer() {
+        // listener закроется RAII; добиваем оставшиеся клиентские слоты.
+        for (const pollfd& entry : fds_) {
+            if (entry.fd >= 0 && entry.fd != listener_.get()) {
+                ::close(entry.fd);
             }
-            std::perror("poll");
-            break;
         }
-        service_pollfds(fds, listener.get());
-        compact_pollfds(fds);
     }
 
-    // listener закроется RAII; клиенты обычно закрыты вручную, но оставшиеся
-    // (если выходим по ошибке) закроем здесь, кроме самого listen.
-    for (const pollfd& entry : fds) {
-        if (entry.fd >= 0 && entry.fd != listener.get()) {
-            ::close(entry.fd);
+    PollEchoServer(const PollEchoServer&) = delete;
+    PollEchoServer& operator=(const PollEchoServer&) = delete;
+
+    void run() {
+        std::cout << "q11: poll сервер слушает порт " << port_ << '\n';
+        for (;;) {
+            // -1 = ждать бесконечно. Массив НЕ пересобираем — лишь передаём его.
+            const int ready = ::poll(fds_.data(), fds_.size(), -1);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;  // прервано сигналом
+                }
+                std::perror("poll");
+                break;
+            }
+            service_pollfds();
+            compact_pollfds();
         }
     }
-}
+
+private:
+    static constexpr std::size_t kBufferSize = 4096;
+
+    // Принять одно ожидающее соединение и добавить новый pollfd с POLLIN.
+    void accept_client() {
+        net::FileDescriptor client{::accept(listener_.get(), nullptr, nullptr)};
+        if (!client.valid()) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                std::perror("accept");
+            }
+            return;
+        }
+        if (!net::set_nonblocking(client.get())) {
+            return;  // client закроется в деструкторе
+        }
+        pollfd entry{};
+        entry.fd = client.release();  // владение переходит в массив
+        entry.events = POLLIN;
+        entry.revents = 0;
+        fds_.push_back(entry);
+    }
+
+    // O(N) проход по массиву pollfd после возврата poll. Закрытые клиенты
+    // помечаем fd = -1, чтобы не двигать массив прямо в цикле (poll такие слоты
+    // игнорирует), компактим отдельным проходом.
+    void service_pollfds() {
+        for (std::size_t index = 0; index < fds_.size(); ++index) {
+            const short revents = fds_[index].revents;
+            if (revents == 0) {
+                continue;  // этот дескриптор не готов
+            }
+            if (fds_[index].fd == listener_.get()) {
+                accept_client();  // может добавить элементы в конец
+                continue;
+            }
+            // POLLHUP/POLLERR/POLLNVAL = клиент отвалился или ошибка.
+            const bool failed = (revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
+            if (failed || (((revents & POLLIN) != 0) && read_once(fds_[index].fd))) {
+                ::close(fds_[index].fd);
+                fds_[index].fd = -1;  // помечаем слот на удаление
+            }
+        }
+    }
+
+    // Убрать помеченные (fd == -1) слоты swap-and-pop. Listen (индекс 0) никогда
+    // не помечается, поэтому остаётся на месте.
+    void compact_pollfds() {
+        std::size_t index = 0;
+        while (index < fds_.size()) {
+            if (fds_[index].fd < 0) {
+                fds_[index] = fds_.back();
+                fds_.pop_back();
+                continue;  // на место встал последний — не инкрементируем
+            }
+            ++index;
+        }
+    }
+
+    // LT-чтение: читаем ОДИН буфер и эхо-отвечаем. Остаток данных даст POLLIN
+    // на следующей итерации. Возвращает true, если соединение надо закрыть.
+    static bool read_once(int client_fd) {
+        std::array<char, kBufferSize> buffer{};
+        const ssize_t bytes_read =
+            ::read(client_fd, buffer.data(), buffer.size());
+        if (bytes_read > 0) {
+            return !net::write_all(client_fd, buffer.data(),
+                                   static_cast<std::size_t>(bytes_read));
+        }
+        if (bytes_read == 0) {
+            return true;  // EOF — клиент закрыл соединение
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return false;  // ложная готовность/прерывание — оставляем жить
+        }
+        std::perror("read");
+        return true;
+    }
+
+    net::FileDescriptor listener_;
+    std::vector<pollfd> fds_;  // индекс 0 — listen; клиентские fd закрываем вручную
+    std::uint16_t       port_;
+};
 
 }  // namespace
 
@@ -293,7 +300,8 @@ void run_poll_loop() {
 //   epoll  : O(1) на готовый fd, ядро ведёт ready-list, масштаб до 100k+ соединений
 int main() {
     try {
-        run_poll_loop();
+        PollEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;

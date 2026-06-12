@@ -210,69 +210,87 @@ switch не умеет: настоящий `call fn`. Без этого пере
 
 ## Минимальный fiber-runtime на C++
 
-Соберём примитивную обёртку над Boost.Context — `Fiber` с `resume()`/`yield()`, без scheduler'а.
+Соберём `Fiber` с `resume()`/`yield()` поверх **тех же** двух примитивов, что в статье про [context switching](userspace_context_switching.md#собственный-context-switch-на-asm) и в `examples/q15_fibers` — никакого Boost.Context, чтобы видеть всю механику:
+
+- `fiber_switch(void** save_sp, void* restore_sp)` — сохранить контекст уходящего (его `sp` → `*save_sp`), восстановить приходящего;
+- `setup_context(void* stack_top, void (*entry)())` — разложить на дне свежего стека «фейковый кадр» так, чтобы **первый** `fiber_switch` в эту фибру «вернулся» в `entry`.
 
 ```cpp
-#include <cstdlib>
-#include <cstring>
+#include <cstddef>
+#include <cstdio>
 #include <functional>
-#include <sys/mman.h>
+#include <utility>
+#include <vector>
 
-namespace bctx = boost::context::detail;
+// Реализация — на ассемблере (context_switch.S), как в examples/q15_fibers.
+extern "C" void  fiber_switch(void** save_sp, void* restore_sp);
+extern "C" void* setup_context(void* stack_top, void (*entry)());
 
 class Fiber {
 public:
-    Fiber(std::function<void()> fn, size_t stack_size = 64 * 1024)
-        : entry_(std::move(fn)), stack_size_(stack_size)
+    explicit Fiber(std::function<void()> body)
+        : body_(std::move(body)), stack_(kStackSize)
     {
-        stack_ = mmap(nullptr, stack_size_ + 4096,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
-        mprotect(stack_, 4096, PROT_NONE);              // guard page
-        void *top = (char*)stack_ + 4096 + stack_size_; // high addr
-        ctx_ = bctx::make_fcontext(top, stack_size_, &Fiber::trampoline);
-    }
-
-    ~Fiber() {
-        munmap(stack_, stack_size_ + 4096);
+        void* top = stack_.data() + stack_.size();
+        // setup_context кладёт на дно стека адрес trampoline как «адрес возврата»:
+        // первый fiber_switch в эту фибру сделает ret именно туда.
+        sp_ = setup_context(top, &Fiber::trampoline);
     }
 
     bool done() const { return done_; }
 
+    // Запустить/продолжить фибру. Управление вернётся сюда, когда она сделает
+    // yield() или завершится.
     void resume() {
-        if (done_) return;
-        auto t = bctx::jump_fcontext(ctx_, this);
-        ctx_ = t.fctx;                                  // сохранить, куда yield'нул
+        if (done_) { return; }
+        current_ = this;
+        fiber_switch(&caller_sp_, sp_);   // сохранить caller'а, прыгнуть в фибру
     }
 
-    // вызывается изнутри fiber'а
+    // Вызывается ИЗ ТЕЛА фибры: вернуть управление тому, кто её resume'нул.
     static void yield() {
-        Fiber *self = current_;
-        auto t = bctx::jump_fcontext(self->caller_, nullptr);
-        self->caller_ = t.fctx;
+        Fiber* self = current_;
+        fiber_switch(&self->sp_, self->caller_sp_);  // сохранить фибру, вернуться к caller
     }
 
 private:
-    static void trampoline(bctx::transfer_t t) {
-        Fiber *self = static_cast<Fiber*>(t.data);
-        self->caller_ = t.fctx;
-        current_ = self;
-        self->entry_();
+    static constexpr std::size_t kStackSize = 64 * 1024;
+
+    // Точка входа фибры. ret внутри ПЕРВОГО fiber_switch прыгает сюда — ровно
+    // один раз. На повторных resume фибра продолжается с места своего yield, а
+    // НЕ отсюда.
+    static void trampoline() {
+        Fiber* self = current_;
+        self->body_();           // тело фибры (может несколько раз сделать yield)
         self->done_ = true;
-        bctx::jump_fcontext(self->caller_, nullptr);    // возврат в caller
+        // Тело кончилось. Из trampoline нельзя «вернуться» — под ним пустой стек,
+        // поэтому уходим к caller'у навсегда.
+        fiber_switch(&self->sp_, self->caller_sp_);
     }
 
-    std::function<void()> entry_;
-    bctx::fcontext_t ctx_     = nullptr;
-    bctx::fcontext_t caller_  = nullptr;
-    void  *stack_             = nullptr;
-    size_t stack_size_        = 0;
-    bool   done_              = false;
-    static thread_local Fiber *current_;
+    std::function<void()> body_;
+    std::vector<char>     stack_;
+    void* sp_        = nullptr;   // вершина стека фибры, пока она не активна
+    void* caller_sp_ = nullptr;   // куда вернуться (контекст resume'нувшего)
+    bool  done_      = false;
+
+    static thread_local Fiber* current_;   // активная фибра (для статического yield)
 };
 
-thread_local Fiber *Fiber::current_ = nullptr;
+thread_local Fiber* Fiber::current_ = nullptr;
 ```
+
+**Когда работает trampoline** — это и есть главный неочевидный момент:
+
+1. В конструкторе `setup_context` кладёт адрес `trampoline` на дно стека как фейковый «адрес возврата».
+2. **Первый** `resume()` → `fiber_switch` восстанавливает этот кадр и делает `ret` → попадает в `trampoline`. То есть
+   **trampoline исполняется ровно один раз, только на первом resume.**
+3. `trampoline` вызывает `body_()`. Когда тело делает `yield()`, контекст фибры сохраняется уже **внутри `yield`** (не в
+   trampoline), и управление уходит к caller'у.
+4. **Повторный** `resume()` → `fiber_switch` восстанавливает контекст, сохранённый в `yield`, и фибра продолжается **с
+   точки после `yield`** — trampoline здесь уже ни при чём.
+5. Когда `body_()` дойдёт до конца, управление вернётся в `trampoline` (он же её вызвал), тот пометит `done_` и уйдёт к
+   caller'у навсегда.
 
 Использование:
 
@@ -292,40 +310,31 @@ int main() {
 }
 ```
 
-Вывод:
+Вывод: `main / fiber: 0 / main / fiber: 1 / main / fiber: 2 / main`.
 
-```
-main
-fiber: 0
-main
-fiber: 1
-main
-fiber: 2
-main
-```
-
-Поток управления:
+Поток управления — обратите внимание, что через trampoline проходит **только первый** resume:
 
 ```mermaid
 sequenceDiagram
-    participant M as main
+    participant M as main (caller)
     participant F as fiber f
-    Note over M: printf("main")
-    M->>+F: f.resume() / jump_fcontext
-    Note right of F: trampoline<br/>entry_(): printf("fiber: 0")
-    F-->>-M: Fiber::yield() / jump_fcontext
-    Note over M: printf("main")
-    M->>+F: f.resume() / jump_fcontext
-    Note right of F: printf("fiber: 1")
-    F-->>-M: Fiber::yield() / jump_fcontext
-    Note over M: ...
-    M->>+F: f.resume() / jump_fcontext
-    Note right of F: printf("fiber: 2")<br/>entry_() returns, done_ = true
-    F-->>-M: jump_fcontext
-    Note over M: done == true, exit loop
+    Note over M: resume() #1
+    M->>F: fiber_switch -> ret в trampoline (единственный раз)
+    Note over F: trampoline -> body(): "fiber: 0"
+    F->>M: yield(): fiber_switch к caller
+    Note over M: "main", resume() #2
+    M->>F: fiber_switch -> продолжение ПОСЛЕ yield
+    Note over F: body: "fiber: 1" (trampoline не участвует)
+    F->>M: yield()
+    Note over M: "main", resume() #3
+    M->>F: fiber_switch -> продолжение после yield
+    Note over F: body: "fiber: 2", тело завершилось
+    Note over F: вернулись в trampoline -> done_=true
+    F->>M: fiber_switch навсегда
+    Note over M: f.done()==true, выход из цикла
 ```
 
-Менее 80 строк кода, и у нас есть рабочий stackful fiber с guard page'ой против stack overflow.
+Около 60 строк — рабочий stackful fiber на собственном asm-switch (guard page против stack overflow добавим ниже).
 
 !!! example "Рабочий пример"
     Полная компилируемая реализация stackful fiber: собственный asm-switch (`context_switch.S` + `fiber_asm.cpp`) и вариант на POSIX `ucontext` (`fiber_ucontext.cpp`), с guard page и `resume`/`yield`. Собрать: `cd examples && make q15` (цели `q15_asm`, `q15_ucontext`).

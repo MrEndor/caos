@@ -17,13 +17,15 @@
 // это epoll (q11) и io_uring (q12). Место, куда встал бы epoll_wait(),
 // помечено ниже комментарием [СЮДА EPOLL].
 //
+// Структура файла: namespace net (слой сокетов) + NonblockingEchoServer.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q10_nonblocking_busyloop/server.cpp -o bin/q10_server
 // run:     ./bin/q10_server     (наблюдай 100% CPU в top даже без клиентов!)
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <utility>
@@ -35,28 +37,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 128;
-constexpr std::size_t kMaxClients = 1024;
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -66,17 +63,10 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
 private:
     void reset() noexcept {
@@ -141,39 +131,6 @@ FileDescriptor make_listener(std::uint16_t port) {
     return listener;
 }
 
-// Принять все ожидающие соединения, пока accept не вернёт EAGAIN, и добавить
-// их в список клиентов (с соблюдением лимита kMaxClients).
-void try_accept(int listen_fd, std::vector<FileDescriptor>& clients) {
-    for (;;) {
-        FileDescriptor client{::accept(listen_fd, nullptr, nullptr)};
-        if (!client.valid()) {
-            // Нет ожидающих соединений — нормально для неблокирующего сокета.
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("accept");
-            break;
-        }
-        if (!set_nonblocking(client.get())) {
-            continue;  // client закроется в деструкторе
-        }
-        if (clients.size() >= kMaxClients) {
-            std::cerr << "достигнут лимит клиентов, отклоняю\n";
-            continue;  // client закроется в деструкторе
-        }
-        clients.push_back(std::move(client));
-    }
-}
-
-// Результат одной попытки обслужить клиента.
-enum class ClientState {
-    kAlive,   // клиент жив, оставляем в списке
-    kClosed,  // клиента надо удалить (EOF или ошибка)
-};
-
 // Записать ровно count байт в неблокирующий сокет (partial-write цикл).
 // Возвращает false при ошибке записи (соединение надо закрыть).
 bool write_all_nonblocking(int client_fd, const char* data, std::size_t count) {
@@ -194,65 +151,115 @@ bool write_all_nonblocking(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// Один опрос (read + echo) одного клиента.
-ClientState try_echo(int client_fd) {
-    std::array<char, kBufferSize> buffer{};
-    const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
-    if (bytes_read > 0) {
-        if (!write_all_nonblocking(client_fd, buffer.data(),
-                                   static_cast<std::size_t>(bytes_read))) {
-            return ClientState::kClosed;
-        }
-        return ClientState::kAlive;
-    }
-    if (bytes_read == 0) {
-        return ClientState::kClosed;  // EOF — клиент закрыл соединение
-    }
-    // bytes_read < 0: EAGAIN — данных пока нет, это НЕ ошибка.
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        return ClientState::kAlive;
-    }
-    std::perror("read");
-    return ClientState::kClosed;
-}
+}  // namespace net
 
-// O(N) sweep по всем клиентам: опрашиваем каждого, удаляем закрывшихся.
-void sweep_clients(std::vector<FileDescriptor>& clients) {
-    for (std::size_t i = 0; i < clients.size();) {
-        if (try_echo(clients[i].get()) == ClientState::kClosed) {
-            // swap-and-pop: O(1) удаление без сдвига хвоста.
-            clients[i] = std::move(clients.back());
-            clients.pop_back();
-        } else {
-            ++i;
+// ───────────────────────── сервер ─────────────────────────
+namespace {
+
+// Неблокирующий echo-сервер: один поток в busy-loop опрашивает listen-сокет и
+// всех клиентов. Намеренно неэффективен — мотивация для epoll (q11).
+class NonblockingEchoServer {
+public:
+    explicit NonblockingEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)}, port_{port} {
+        clients_.reserve(kMaxClients);
+    }
+
+    void run() {
+        std::cout << "q10: неблокирующий busy-loop сервер на порту " << port_
+                  << " (внимание: 100% CPU)\n";
+        for (;;) {
+            // [СЮДА EPOLL] В нормальном сервере здесь стоял бы epoll_wait(),
+            // который УСНУЛ бы до появления событий и вернул только готовые fd.
+            // Здесь же мы наугад опрашиваем всех -> вот и busy-loop.
+            try_accept();
+            sweep_clients();
+            // Конец итерации -> сразу новая. Поток никогда не спит -> жжём CPU.
         }
     }
-}
 
-// Бесконечный busy-loop: на каждой итерации полный проход по дескрипторам.
-void run_busy_loop() {
-    const FileDescriptor listener = make_listener(kPort);
-    std::vector<FileDescriptor> clients;
-    clients.reserve(kMaxClients);
+private:
+    static constexpr std::size_t kMaxClients = 1024;
+    static constexpr std::size_t kBufferSize = 4096;
 
-    std::cout << "q10: неблокирующий busy-loop сервер на порту " << kPort
-              << " (внимание: 100% CPU)\n";
+    // Результат одной попытки обслужить клиента.
+    enum class ClientState {
+        kAlive,   // клиент жив, оставляем в списке
+        kClosed,  // клиента надо удалить (EOF или ошибка)
+    };
 
-    for (;;) {
-        // [СЮДА EPOLL] В нормальном сервере здесь стоял бы epoll_wait(),
-        // который УСНУЛ бы до появления событий и вернул только готовые fd.
-        // Здесь же мы наугад опрашиваем всех -> вот и busy-loop.
-        try_accept(listener.get(), clients);
-        sweep_clients(clients);
-        // Конец итерации -> сразу новая. Поток никогда не спит -> жжём CPU.
+    // Принять все ожидающие соединения, пока accept не вернёт EAGAIN.
+    void try_accept() {
+        for (;;) {
+            net::FileDescriptor client{::accept(listener_.get(), nullptr, nullptr)};
+            if (!client.valid()) {
+                // Нет ожидающих соединений — нормально для неблокирующего сокета.
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::perror("accept");
+                break;
+            }
+            if (!net::set_nonblocking(client.get())) {
+                continue;  // client закроется в деструкторе
+            }
+            if (clients_.size() >= kMaxClients) {
+                std::cerr << "достигнут лимит клиентов, отклоняю\n";
+                continue;  // client закроется в деструкторе
+            }
+            clients_.push_back(std::move(client));
+        }
     }
-}
+
+    // O(N) sweep по всем клиентам: опрашиваем каждого, удаляем закрывшихся.
+    void sweep_clients() {
+        for (std::size_t i = 0; i < clients_.size();) {
+            if (try_echo(clients_[i].get()) == ClientState::kClosed) {
+                // swap-and-pop: O(1) удаление без сдвига хвоста.
+                clients_[i] = std::move(clients_.back());
+                clients_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // Один опрос (read + echo) одного клиента.
+    static ClientState try_echo(int client_fd) {
+        std::array<char, kBufferSize> buffer{};
+        const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
+        if (bytes_read > 0) {
+            if (!net::write_all_nonblocking(client_fd, buffer.data(),
+                                            static_cast<std::size_t>(bytes_read))) {
+                return ClientState::kClosed;
+            }
+            return ClientState::kAlive;
+        }
+        if (bytes_read == 0) {
+            return ClientState::kClosed;  // EOF — клиент закрыл соединение
+        }
+        // bytes_read < 0: EAGAIN — данных пока нет, это НЕ ошибка.
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return ClientState::kAlive;
+        }
+        std::perror("read");
+        return ClientState::kClosed;
+    }
+
+    net::FileDescriptor              listener_;
+    std::vector<net::FileDescriptor> clients_;
+    std::uint16_t                    port_;
+};
 
 }  // namespace
 
 int main() {
     try {
-        run_busy_loop();
+        NonblockingEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;

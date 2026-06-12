@@ -6,7 +6,7 @@
 //
 // Тонкости, которые показывает вопрос:
 //  - владение клиентским fd передаётся в поток ПЕРЕМЕЩЕНИЕМ RAII-обёртки
-//    (std::move в лямбду). Так каждый поток владеет своим дескриптором, и нет
+//    (std::move в поток). Так каждый поток владеет своим дескриптором, и нет
 //    гонки за общей переменной, которую main мог бы перезаписать след. accept().
 //  - thread.detach() — поток сам освобождает свои ресурсы при завершении,
 //    join делать не нужно (иначе main блокировался бы на каждом клиенте).
@@ -14,13 +14,15 @@
 // Минус модели: на 10k клиентов = 10k потоков (по ~8 МБ стека + контекст-свитчи).
 // Это мотивация для пулов потоков (q05) и event-loop (q10/q11/q12).
 //
+// Структура файла: namespace net (слой сокетов) + ThreadedEchoServer.
+//
 // compile: g++ -std=c++20 -O2 -Wall -Wextra q02_threaded_tcp/server.cpp -o bin/q02_server -pthread
 // run:     ./bin/q02_server     (клиент: ./bin/q02_client "hello")
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <system_error>
 #include <thread>
@@ -31,27 +33,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+// ───────────────────────── слой сокетов ─────────────────────────
+namespace net {
 
-constexpr std::uint16_t kPort = 8080;
 constexpr int kBacklog = 128;
-constexpr std::size_t kBufferSize = 4096;
 
 // RAII-обёртка над файловым дескриптором: close() в деструкторе.
 class FileDescriptor {
 public:
     FileDescriptor() = default;
 
-    explicit FileDescriptor(int fd) noexcept
-        : fd_{fd} {
-    }
+    explicit FileDescriptor(int fd) noexcept : fd_{fd} {}
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
     FileDescriptor(FileDescriptor&& other) noexcept
-        : fd_{std::exchange(other.fd_, -1)} {
-    }
+        : fd_{std::exchange(other.fd_, -1)} {}
 
     FileDescriptor& operator=(FileDescriptor&& other) noexcept {
         if (this != &other) {
@@ -61,17 +59,10 @@ public:
         return *this;
     }
 
-    ~FileDescriptor() {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
-    [[nodiscard]] int get() const noexcept {
-        return fd_;
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return fd_ >= 0;
-    }
+    [[nodiscard]] int  get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
 
 private:
     void reset() noexcept {
@@ -134,65 +125,87 @@ bool write_all(int client_fd, const char* data, std::size_t count) {
     return true;
 }
 
-// Тело worker-потока: владеет client (по значению — перемещено сюда),
-// делает echo и закрывает сокет автоматически в деструкторе FileDescriptor.
-void handle_client(FileDescriptor client) {
-    std::array<char, kBufferSize> buffer{};
-    for (;;) {
-        const ssize_t bytes_read = ::read(client.get(), buffer.data(), buffer.size());
-        if (bytes_read > 0) {
-            if (!write_all(client.get(), buffer.data(),
-                           static_cast<std::size_t>(bytes_read))) {
-                return;
-            }
-        } else if (bytes_read == 0) {
-            return;  // EOF — клиент закрыл соединение
-        } else {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("read");
-            return;
+}  // namespace net
+
+// ───────────────────────── сервер ─────────────────────────
+namespace {
+
+// Многопоточный echo-сервер: на каждого клиента — отдельный detached-поток.
+class ThreadedEchoServer {
+public:
+    explicit ThreadedEchoServer(std::uint16_t port)
+        : listener_{net::make_listener(port)}, port_{port} {}
+
+    void run() {
+        std::cout << "q02: многопоточный сервер слушает порт " << port_
+                  << " (поток на клиента)\n";
+        for (;;) {
+            accept_one();
         }
     }
-}
 
-// Главный цикл: accept -> запуск detached-потока на каждого клиента.
-void run_server() {
-    const FileDescriptor listener = make_listener(kPort);
-    std::cout << "q02: многопоточный сервер слушает порт " << kPort
-              << " (поток на клиента)\n";
+private:
+    static constexpr std::size_t kBufferSize = 4096;
 
-    for (;;) {
+    // Принять соединение и запустить detached-поток на его обслуживание.
+    void accept_one() {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
-        FileDescriptor client{::accept(
-            listener.get(), reinterpret_cast<sockaddr*>(&client_addr), &addr_len)};
+        net::FileDescriptor client{::accept(
+            listener_.get(), reinterpret_cast<sockaddr*>(&client_addr), &addr_len)};
         if (!client.valid()) {
             if (errno == EINTR) {
-                continue;
+                return;
             }
             std::perror("accept");
-            continue;
+            return;
         }
 
         try {
             // Передаём владение fd в поток через std::move — никакой гонки за
             // общей переменной. detach: поток сам уберёт за собой при выходе.
-            std::thread worker{handle_client, std::move(client)};
+            std::thread worker{&ThreadedEchoServer::handle_client, std::move(client)};
             worker.detach();
         } catch (const std::system_error& error) {
             // Не удалось создать поток — client закроется в деструкторе.
             std::cerr << "не удалось создать поток: " << error.what() << '\n';
         }
     }
-}
+
+    // Тело worker-потока: владеет client (по значению — перемещено сюда), делает
+    // echo и закрывает сокет автоматически в деструкторе FileDescriptor.
+    static void handle_client(net::FileDescriptor client) {
+        std::array<char, kBufferSize> buffer{};
+        for (;;) {
+            const ssize_t bytes_read =
+                ::read(client.get(), buffer.data(), buffer.size());
+            if (bytes_read > 0) {
+                if (!net::write_all(client.get(), buffer.data(),
+                                    static_cast<std::size_t>(bytes_read))) {
+                    return;
+                }
+            } else if (bytes_read == 0) {
+                return;  // EOF — клиент закрыл соединение
+            } else {
+                if (errno == EINTR) {
+                    continue;
+                }
+                std::perror("read");
+                return;
+            }
+        }
+    }
+
+    net::FileDescriptor listener_;
+    std::uint16_t       port_;
+};
 
 }  // namespace
 
 int main() {
     try {
-        run_server();
+        ThreadedEchoServer server{8080};
+        server.run();
     } catch (const std::system_error& error) {
         std::cerr << "фатальная ошибка: " << error.what() << '\n';
         return 1;
